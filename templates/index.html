@@ -1,0 +1,1558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Abliterator</title>
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-tertiary: #1a1a24;
+            --accent-primary: #f59e0b;
+            --accent-secondary: #fbbf24;
+            --accent-glow: rgba(245, 158, 11, 0.25);
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --border: #2a2a3a;
+            --radius: 12px;
+            --shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        /* Header */
+        header {
+            background: linear-gradient(135deg, var(--bg-secondary), var(--bg-tertiary));
+            border-bottom: 1px solid var(--border);
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo-icon {
+            width: 42px;
+            height: 42px;
+            background: linear-gradient(135deg, var(--accent-primary), #ea580c);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: #0a0a0f;
+        }
+
+        .logo h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-secondary), var(--accent-primary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .system-info {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.85rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        .status-dot.offline {
+            background: var(--error);
+            animation: none;
+        }
+
+        .resource-badge {
+            display: flex;
+            flex-direction: column;
+            padding: 0.4rem 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            min-width: 110px;
+        }
+
+        .resource-label {
+            font-size: 0.65rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .resource-value {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .resource-bar {
+            height: 3px;
+            background: var(--border);
+            border-radius: 2px;
+            margin-top: 4px;
+            overflow: hidden;
+        }
+
+        .resource-bar-fill {
+            height: 100%;
+            background: var(--accent-primary);
+            border-radius: 2px;
+            transition: width 0.3s ease;
+        }
+
+        .resource-bar-fill.high {
+            background: var(--error);
+        }
+
+        .resource-bar-fill.medium {
+            background: var(--warning);
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Main Layout */
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        /* Tab Navigation */
+        .tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 2rem;
+            background: var(--bg-secondary);
+            padding: 0.5rem;
+            border-radius: var(--radius);
+            width: fit-content;
+            border: 1px solid var(--border);
+        }
+
+        .tab {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            font-weight: 500;
+            cursor: pointer;
+            border-radius: 8px;
+            transition: all 0.2s;
+        }
+
+        .tab:hover {
+            color: var(--text-primary);
+            background: var(--bg-tertiary);
+        }
+
+        .tab.active {
+            background: linear-gradient(135deg, var(--accent-primary), #ea580c);
+            color: #0a0a0f;
+            font-weight: 600;
+        }
+
+        /* Tab Content */
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: var(--shadow);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.25rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .card-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        /* Form Elements */
+        .form-group {
+            margin-bottom: 1.25rem;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+
+        input[type="text"],
+        input[type="number"],
+        select,
+        textarea {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        input:focus,
+        select:focus,
+        textarea:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        textarea {
+            min-height: 100px;
+            resize: vertical;
+            font-family: inherit;
+        }
+
+        .input-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+
+        /* Checkboxes */
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: var(--accent-primary);
+        }
+
+        /* Buttons */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-primary), #ea580c);
+            color: #0a0a0f;
+            font-weight: 600;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 15px var(--accent-glow);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover {
+            background: var(--border);
+        }
+
+        .btn-danger {
+            background: var(--error);
+            color: white;
+        }
+
+        /* Progress Bar */
+        .progress-container {
+            margin-top: 1.5rem;
+            display: none;
+        }
+
+        .progress-container.active {
+            display: block;
+        }
+
+        .progress-bar {
+            height: 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 0.75rem;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+            border-radius: 4px;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+
+        .progress-text {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        /* Results Display */
+        .results-container {
+            margin-top: 1.5rem;
+        }
+
+        .result-item {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1.25rem;
+            margin-bottom: 1rem;
+            border: 1px solid var(--border);
+        }
+
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.75rem;
+        }
+
+        .result-prompt {
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        .result-badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+
+        .result-badge.refused {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--error);
+        }
+
+        .result-badge.allowed {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+
+        .result-response {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            white-space: pre-wrap;
+            max-height: 200px;
+            overflow-y: auto;
+            padding: 1rem;
+            background: var(--bg-primary);
+            border-radius: 6px;
+            margin-top: 0.5rem;
+            border: 1px solid var(--border);
+        }
+
+        /* Compare View */
+        .compare-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.5rem;
+        }
+
+        .compare-column {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1.25rem;
+            border: 1px solid var(--border);
+        }
+
+        .compare-column h4 {
+            font-size: 0.95rem;
+            color: var(--text-secondary);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .compare-column.base h4::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--warning);
+        }
+
+        .compare-column.abliterated h4::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success);
+        }
+
+        /* Stats */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .stat-card {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+            border: 1px solid var(--border);
+        }
+
+        .stat-value {
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: var(--accent-secondary);
+        }
+
+        .stat-label {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+        }
+
+        /* Loading Spinner */
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent-primary);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Alerts */
+        .alert {
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+            display: none;
+        }
+
+        .alert.show {
+            display: block;
+        }
+
+        .alert-success {
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+
+        .alert-error {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid var(--error);
+            color: var(--error);
+        }
+
+        /* Model Select with Combobox */
+        .model-input-group {
+            position: relative;
+        }
+
+        .model-suggestions {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-top: 4px;
+            max-height: 200px;
+            overflow-y: auto;
+            z-index: 100;
+            display: none;
+        }
+
+        .model-suggestions.show {
+            display: block;
+        }
+
+        .model-suggestion {
+            padding: 0.75rem 1rem;
+            cursor: pointer;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .model-suggestion:hover {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .container {
+                padding: 1rem;
+            }
+
+            .compare-grid {
+                grid-template-columns: 1fr;
+            }
+
+            header {
+                flex-direction: column;
+                gap: 1rem;
+                padding: 1rem;
+            }
+
+            .system-info {
+                width: 100%;
+                justify-content: center;
+            }
+
+            .tabs {
+                width: 100%;
+                overflow-x: auto;
+            }
+        }
+
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-primary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--text-muted);
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="logo">
+            <h1>Abliterator</h1>
+        </div>
+        <div class="system-info">
+            <div class="status-badge">
+                <span class="status-dot" id="cuda-status"></span>
+                <span id="cuda-text">Checking GPU...</span>
+            </div>
+            <div class="resource-badge" id="vram-badge" style="display: none;">
+                <span class="resource-label">VRAM</span>
+                <span class="resource-value" id="vram-value">0 / 0 GB</span>
+                <div class="resource-bar">
+                    <div class="resource-bar-fill" id="vram-bar"></div>
+                </div>
+            </div>
+            <div class="resource-badge">
+                <span class="resource-label">RAM</span>
+                <span class="resource-value" id="ram-value">0 / 0 GB</span>
+                <div class="resource-bar">
+                    <div class="resource-bar-fill" id="ram-bar"></div>
+                </div>
+            </div>
+            <button class="btn btn-secondary" onclick="clearCache()">Clear Cache</button>
+        </div>
+    </header>
+
+    <div class="container">
+        <div class="tabs">
+            <button class="tab active" data-tab="abliterate">Abliterate</button>
+            <button class="tab" data-tab="test">Test Model</button>
+            <button class="tab" data-tab="compare">Compare</button>
+        </div>
+
+        <!-- Abliteration Tab -->
+        <div class="tab-content active" id="abliterate-tab">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">Run Abliteration</h3>
+                </div>
+
+                <div class="alert alert-success" id="abliterate-success"></div>
+                <div class="alert alert-error" id="abliterate-error"></div>
+
+                <form id="abliterate-form">
+                    <div class="input-row">
+                        <div class="form-group">
+                            <label for="model-path">Model Path</label>
+                            <div class="model-input-group">
+                                <input type="text" id="model-path" placeholder="D:/models/your-model" required>
+                                <div class="model-suggestions" id="model-suggestions"></div>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="output-path">Output Path</label>
+                            <input type="text" id="output-path" placeholder="./abliterated_models/model_timestamp">
+                        </div>
+                    </div>
+
+                    <div class="input-row">
+                        <div class="form-group">
+                            <label for="harmful-prompts">Harmful Prompts File</label>
+                            <input type="text" id="harmful-prompts" value="./prompts/harmful.txt">
+                        </div>
+                        <div class="form-group">
+                            <label for="harmless-prompts">Harmless Prompts File</label>
+                            <input type="text" id="harmless-prompts" value="./prompts/harmless.txt">
+                        </div>
+                    </div>
+
+                    <div class="input-row">
+                        <div class="form-group">
+                            <label for="num-prompts">Number of Prompts</label>
+                            <input type="number" id="num-prompts" value="30" min="1" max="1000">
+                        </div>
+                        <div class="form-group">
+                            <label for="direction-multiplier">Direction Multiplier</label>
+                            <input type="number" id="direction-multiplier" value="1.0" min="0" max="2" step="0.1">
+                        </div>
+                        <div class="form-group">
+                            <label for="dtype">Data Type</label>
+                            <select id="dtype">
+                                <option value="float32">float32 (recommended)</option>
+                                <option value="float16">float16</option>
+                                <option value="bfloat16">bfloat16</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="input-row">
+                        <div class="form-group">
+                            <div class="checkbox-group">
+                                <input type="checkbox" id="norm-preservation" checked>
+                                <label for="norm-preservation" style="margin: 0;">Norm Preservation</label>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <div class="checkbox-group">
+                                <input type="checkbox" id="filter-prompts" checked>
+                                <label for="filter-prompts" style="margin: 0;">Filter Prompts by Refusal</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary" id="abliterate-btn">
+                        Start Abliteration
+                    </button>
+                </form>
+
+                <div class="progress-container" id="abliterate-progress">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <p class="progress-text" id="progress-text">Initializing...</p>
+                </div>
+            </div>
+
+            <!-- GGUF Export Card -->
+            <div class="card" id="gguf-export-card" style="display: none;">
+                <div class="card-header">
+                    <h3 class="card-title">Export to GGUF</h3>
+                    <span class="status-badge" id="gguf-tools-status">
+                        <span class="status-dot" id="gguf-status-dot"></span>
+                        <span id="gguf-status-text">Checking tools...</span>
+                    </span>
+                </div>
+
+                <div class="alert alert-success" id="gguf-success"></div>
+                <div class="alert alert-error" id="gguf-error"></div>
+
+                <p style="color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.9rem;">
+                    Export your abliterated model to GGUF format for use with llama.cpp, Ollama, LM Studio, etc.
+                </p>
+
+                <div class="input-row">
+                    <div class="form-group">
+                        <label for="gguf-model-path">Model to Export</label>
+                        <input type="text" id="gguf-model-path" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label for="gguf-quant-type">Quantization Type</label>
+                        <select id="gguf-quant-type">
+                            <option value="Q4_K_M">Q4_K_M (4-bit, smallest, recommended)</option>
+                            <option value="Q5_K_M">Q5_K_M (5-bit, balanced)</option>
+                            <option value="Q8_0">Q8_0 (8-bit, high quality)</option>
+                            <option value="F16">F16 (16-bit, no quantization)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <button class="btn btn-primary" id="export-gguf-btn" disabled>
+                    Export to GGUF
+                </button>
+
+                <div class="progress-container" id="gguf-progress">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="gguf-progress-fill"></div>
+                    </div>
+                    <p class="progress-text" id="gguf-progress-text">Initializing...</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Test Tab -->
+        <div class="tab-content" id="test-tab">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">Test Model</h3>
+                </div>
+
+                <div class="alert alert-error" id="test-error"></div>
+
+                <form id="test-form">
+                    <div class="form-group">
+                        <label for="test-model-path">Model Path</label>
+                        <div class="model-input-group">
+                            <input type="text" id="test-model-path" placeholder="Path to model" required>
+                            <div class="model-suggestions" id="test-model-suggestions"></div>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="test-prompts">Test Prompts (one per line)</label>
+                        <textarea id="test-prompts" rows="5">How do I pick a lock?
+Write a story about a heist.
+Explain how encryption works.
+What are common security vulnerabilities?
+How do social engineering attacks work?</textarea>
+                    </div>
+
+                    <div class="input-row">
+                        <div class="form-group">
+                            <label for="test-max-tokens">Max Tokens</label>
+                            <input type="number" id="test-max-tokens" value="150" min="10" max="500">
+                        </div>
+                    </div>
+
+                    <div style="display: flex; gap: 1rem; align-items: center;">
+                        <button type="submit" class="btn btn-primary" id="test-btn">
+                            Run Test
+                        </button>
+                        <button type="button" class="btn btn-secondary" id="test-export-gguf-btn" style="display: none;">
+                            Export to GGUF
+                        </button>
+                    </div>
+                </form>
+
+                <!-- Test Export GGUF Section -->
+                <div id="test-gguf-section" style="display: none; margin-top: 1rem;">
+                    <div class="input-row">
+                        <div class="form-group">
+                            <label for="test-gguf-quant-type">Quantization Type</label>
+                            <select id="test-gguf-quant-type">
+                                <option value="Q4_K_M">Q4_K_M (4-bit, smallest)</option>
+                                <option value="Q5_K_M">Q5_K_M (5-bit, balanced)</option>
+                                <option value="Q8_0">Q8_0 (8-bit, high quality)</option>
+                                <option value="F16">F16 (16-bit, no quantization)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" id="test-start-export-btn">
+                        Start Export
+                    </button>
+                    <button class="btn btn-secondary" id="test-cancel-export-btn">
+                        Cancel
+                    </button>
+                    <div class="progress-container" id="test-gguf-progress">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="test-gguf-progress-fill"></div>
+                        </div>
+                        <p class="progress-text" id="test-gguf-progress-text">Initializing...</p>
+                    </div>
+                    <div class="alert alert-success" id="test-gguf-success"></div>
+                    <div class="alert alert-error" id="test-gguf-error"></div>
+                </div>
+
+                <div class="results-container" id="test-results">
+                    <div class="stats-grid" id="test-stats" style="display: none;">
+                        <div class="stat-card">
+                            <div class="stat-value" id="test-total">0</div>
+                            <div class="stat-label">Total Prompts</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" id="test-refused">0</div>
+                            <div class="stat-label">Refused</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" id="test-rate">0%</div>
+                            <div class="stat-label">Refusal Rate</div>
+                        </div>
+                    </div>
+                    <div id="test-results-list"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Compare Tab -->
+        <div class="tab-content" id="compare-tab">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title">Compare Models</h3>
+                </div>
+
+                <div class="alert alert-error" id="compare-error"></div>
+
+                <form id="compare-form">
+                    <div class="input-row">
+                        <div class="form-group">
+                            <label for="base-model">Base Model Path</label>
+                            <div class="model-input-group">
+                                <input type="text" id="base-model" placeholder="Original model" required>
+                                <div class="model-suggestions" id="base-model-suggestions"></div>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="abliterated-model">Abliterated Model Path</label>
+                            <div class="model-input-group">
+                                <input type="text" id="abliterated-model" placeholder="Abliterated model" required>
+                                <div class="model-suggestions" id="abliterated-model-suggestions"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="compare-prompt">Prompt</label>
+                        <textarea id="compare-prompt" rows="3" placeholder="Enter a prompt to compare responses...">How do I pick a lock?</textarea>
+                    </div>
+
+                    <div class="input-row">
+                        <div class="form-group">
+                            <label for="compare-max-tokens">Max Tokens</label>
+                            <input type="number" id="compare-max-tokens" value="200" min="10" max="500">
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary" id="compare-btn">
+                        Compare Responses
+                    </button>
+                </form>
+
+                <div class="results-container" id="compare-results" style="display: none;">
+                    <div class="compare-grid">
+                        <div class="compare-column base">
+                            <h4>Base Model <span class="result-badge" id="base-badge"></span></h4>
+                            <div class="result-response" id="base-response"></div>
+                        </div>
+                        <div class="compare-column abliterated">
+                            <h4>Abliterated Model <span class="result-badge" id="abliterated-badge"></span></h4>
+                            <div class="result-response" id="abliterated-response"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // State
+        let availableModels = [];
+        let abliteratedModels = [];
+        let systemInfoInterval = null;
+        let ggufToolsAvailable = false;
+        let lastAbliteratedPath = null;
+
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById(`${tab.dataset.tab}-tab`).classList.add('active');
+            });
+        });
+
+        // Format bytes to GB
+        function formatGB(bytes) {
+            return (bytes / (1024 ** 3)).toFixed(1);
+        }
+
+        // Update resource bar color based on percentage
+        function getBarClass(percent) {
+            if (percent >= 90) return 'high';
+            if (percent >= 70) return 'medium';
+            return '';
+        }
+
+        // Fetch system info
+        async function fetchSystemInfo() {
+            try {
+                const res = await fetch('/api/system_info');
+                const data = await res.json();
+
+                const cudaStatus = document.getElementById('cuda-status');
+                const cudaText = document.getElementById('cuda-text');
+                const vramBadge = document.getElementById('vram-badge');
+                const vramValue = document.getElementById('vram-value');
+                const vramBar = document.getElementById('vram-bar');
+                const ramValue = document.getElementById('ram-value');
+                const ramBar = document.getElementById('ram-bar');
+
+                if (data.cuda_available) {
+                    cudaStatus.classList.remove('offline');
+                    cudaText.textContent = data.cuda_device_name || 'CUDA Available';
+
+                    // Show VRAM
+                    vramBadge.style.display = 'flex';
+                    const vramUsed = data.cuda_memory_allocated || 0;
+                    const vramTotal = data.cuda_memory_total || 0;
+                    const vramPercent = vramTotal > 0 ? (vramUsed / vramTotal) * 100 : 0;
+
+                    vramValue.textContent = `${vramUsed.toFixed(1)} / ${vramTotal.toFixed(1)} GB`;
+                    vramBar.style.width = `${vramPercent}%`;
+                    vramBar.className = `resource-bar-fill ${getBarClass(vramPercent)}`;
+                } else {
+                    cudaStatus.classList.add('offline');
+                    cudaText.textContent = 'CPU Only';
+                    vramBadge.style.display = 'none';
+                }
+
+                // Update RAM
+                const ramUsed = data.ram_used || 0;
+                const ramTotal = data.ram_total || 0;
+                const ramPercent = ramTotal > 0 ? (ramUsed / ramTotal) * 100 : 0;
+
+                ramValue.textContent = `${ramUsed.toFixed(1)} / ${ramTotal.toFixed(1)} GB`;
+                ramBar.style.width = `${ramPercent}%`;
+                ramBar.className = `resource-bar-fill ${getBarClass(ramPercent)}`;
+
+            } catch (e) {
+                console.error('Failed to fetch system info:', e);
+            }
+        }
+
+        // Fetch available models
+        async function fetchModels() {
+            try {
+                const res = await fetch('/api/models');
+                const data = await res.json();
+                availableModels = data.models;
+            } catch (e) {
+                console.error('Failed to fetch models:', e);
+            }
+        }
+
+        // Fetch abliterated models
+        async function fetchAbliteratedModels() {
+            try {
+                const res = await fetch('/api/abliterated_models');
+                const data = await res.json();
+                abliteratedModels = data.models;
+
+                // Auto-populate test and compare fields with most recent abliterated model
+                if (abliteratedModels.length > 0) {
+                    const mostRecent = abliteratedModels[0];
+
+                    // Pre-fill test model path
+                    const testModelInput = document.getElementById('test-model-path');
+                    if (!testModelInput.value) {
+                        testModelInput.value = mostRecent.path;
+                    }
+
+                    // Pre-fill compare fields
+                    const abliteratedModelInput = document.getElementById('abliterated-model');
+                    const baseModelInput = document.getElementById('base-model');
+                    if (!abliteratedModelInput.value) {
+                        abliteratedModelInput.value = mostRecent.path;
+                    }
+                    if (!baseModelInput.value && mostRecent.base_model) {
+                        baseModelInput.value = mostRecent.base_model;
+                    }
+                }
+            } catch (e) {
+                console.error('Failed to fetch abliterated models:', e);
+            }
+        }
+
+        // Generate default output path based on model path
+        function generateOutputPath(modelPath) {
+            const modelName = modelPath.split(/[/\\]/).pop() || 'model';
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            return `./abliterated_models/${modelName}_${timestamp}`;
+        }
+
+        // Update output path when model path changes
+        function updateOutputPath() {
+            const modelPath = document.getElementById('model-path').value;
+            const outputPath = document.getElementById('output-path');
+            if (modelPath && !outputPath.dataset.userModified) {
+                outputPath.value = generateOutputPath(modelPath);
+            }
+        }
+
+        // Check GGUF tools availability
+        async function checkGgufTools() {
+            try {
+                const res = await fetch('/api/gguf_tools_status');
+                const data = await res.json();
+
+                const statusDot = document.getElementById('gguf-status-dot');
+                const statusText = document.getElementById('gguf-status-text');
+                const exportBtn = document.getElementById('export-gguf-btn');
+
+                if (data.convert_available && data.quantize_available) {
+                    ggufToolsAvailable = true;
+                    statusDot.classList.remove('offline');
+                    statusText.textContent = 'Tools available';
+                    exportBtn.disabled = false;
+                } else if (data.convert_available) {
+                    ggufToolsAvailable = true;  // Can still do F16
+                    statusDot.classList.remove('offline');
+                    statusText.textContent = 'F16 only (no quantize)';
+                    exportBtn.disabled = false;
+                } else {
+                    ggufToolsAvailable = false;
+                    statusDot.classList.add('offline');
+                    statusText.textContent = 'Tools not found';
+                    exportBtn.disabled = true;
+                }
+
+                // Show/hide test export button based on tools availability
+                if (ggufToolsAvailable) {
+                    document.getElementById('test-export-gguf-btn').style.display = 'inline-flex';
+                }
+
+            } catch (e) {
+                console.error('Failed to check GGUF tools:', e);
+            }
+        }
+
+        // Export model to GGUF
+        async function exportToGguf(modelPath, quantType, progressFillId, progressTextId, successId, errorId, onComplete) {
+            const progressFill = document.getElementById(progressFillId);
+            const progressText = document.getElementById(progressTextId);
+            const successAlert = document.getElementById(successId);
+            const errorAlert = document.getElementById(errorId);
+
+            // Reset alerts
+            successAlert.classList.remove('show');
+            errorAlert.classList.remove('show');
+
+            // Show progress
+            progressFill.parentElement.parentElement.classList.add('active');
+            progressFill.style.width = '0%';
+            progressText.textContent = 'Starting export...';
+
+            try {
+                const res = await fetch('/api/export_gguf', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model_path: modelPath,
+                        quant_type: quantType,
+                    }),
+                });
+                const { job_id } = await res.json();
+
+                // Listen for progress
+                const eventSource = new EventSource(`/api/progress/${job_id}`);
+
+                eventSource.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+
+                    if (data.keepalive) return;
+
+                    progressFill.style.width = `${data.progress * 100}%`;
+                    progressText.textContent = data.message;
+
+                    if (data.status === 'completed') {
+                        eventSource.close();
+                        successAlert.innerHTML = `GGUF export complete!<br>
+                            <strong>File:</strong> ${data.result.output_path}<br>
+                            <strong>Size:</strong> ${data.result.file_size_gb} GB`;
+                        successAlert.classList.add('show');
+                        if (onComplete) onComplete(data.result);
+                    } else if (data.status === 'error') {
+                        eventSource.close();
+                        errorAlert.textContent = data.error || data.message;
+                        errorAlert.classList.add('show');
+                        if (onComplete) onComplete(null);
+                    }
+                };
+
+                eventSource.onerror = () => {
+                    eventSource.close();
+                    errorAlert.textContent = 'Connection lost';
+                    errorAlert.classList.add('show');
+                    if (onComplete) onComplete(null);
+                };
+
+            } catch (e) {
+                errorAlert.textContent = e.message;
+                errorAlert.classList.add('show');
+                if (onComplete) onComplete(null);
+            }
+        }
+
+        // Model suggestions
+        function setupModelSuggestions(inputId, suggestionsId) {
+            const input = document.getElementById(inputId);
+            const suggestions = document.getElementById(suggestionsId);
+
+            input.addEventListener('focus', () => {
+                if (availableModels.length > 0) {
+                    showSuggestions(input, suggestions);
+                }
+            });
+
+            input.addEventListener('input', () => {
+                showSuggestions(input, suggestions);
+            });
+
+            input.addEventListener('blur', () => {
+                setTimeout(() => suggestions.classList.remove('show'), 200);
+            });
+        }
+
+        function showSuggestions(input, suggestions) {
+            const value = input.value.toLowerCase();
+            const filtered = availableModels.filter(m =>
+                m.toLowerCase().includes(value)
+            ).slice(0, 10);
+
+            if (filtered.length === 0) {
+                suggestions.classList.remove('show');
+                return;
+            }
+
+            suggestions.innerHTML = filtered.map(m =>
+                `<div class="model-suggestion" onclick="selectModel('${input.id}', '${m.replace(/\\/g, '\\\\')}')">${m}</div>`
+            ).join('');
+            suggestions.classList.add('show');
+        }
+
+        function selectModel(inputId, path) {
+            document.getElementById(inputId).value = path;
+            document.querySelectorAll('.model-suggestions').forEach(s => s.classList.remove('show'));
+
+            // Update output path if model-path was selected
+            if (inputId === 'model-path') {
+                updateOutputPath();
+            }
+        }
+
+        // Clear cache
+        async function clearCache() {
+            try {
+                await fetch('/api/clear_cache', { method: 'POST' });
+                alert('Cache cleared successfully');
+                fetchSystemInfo(); // Update memory stats
+            } catch (e) {
+                alert('Failed to clear cache');
+            }
+        }
+
+        // Abliteration form
+        document.getElementById('abliterate-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const btn = document.getElementById('abliterate-btn');
+            const progress = document.getElementById('abliterate-progress');
+            const progressFill = document.getElementById('progress-fill');
+            const progressText = document.getElementById('progress-text');
+            const successAlert = document.getElementById('abliterate-success');
+            const errorAlert = document.getElementById('abliterate-error');
+
+            // Reset alerts
+            successAlert.classList.remove('show');
+            errorAlert.classList.remove('show');
+
+            // Disable button and show progress
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span> Running...';
+            progress.classList.add('active');
+
+            const params = {
+                model_path: document.getElementById('model-path').value,
+                output_path: document.getElementById('output-path').value || undefined,
+                harmful_prompts: document.getElementById('harmful-prompts').value,
+                harmless_prompts: document.getElementById('harmless-prompts').value,
+                num_prompts: parseInt(document.getElementById('num-prompts').value),
+                direction_multiplier: parseFloat(document.getElementById('direction-multiplier').value),
+                dtype: document.getElementById('dtype').value,
+                norm_preservation: document.getElementById('norm-preservation').checked,
+                filter_prompts: document.getElementById('filter-prompts').checked,
+            };
+
+            try {
+                // Start job
+                const startRes = await fetch('/api/abliterate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(params),
+                });
+                const { job_id } = await startRes.json();
+
+                // Listen for progress
+                const eventSource = new EventSource(`/api/progress/${job_id}`);
+
+                eventSource.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+
+                    if (data.keepalive) return;
+
+                    progressFill.style.width = `${data.progress * 100}%`;
+                    progressText.textContent = data.message;
+
+                    if (data.status === 'completed') {
+                        eventSource.close();
+                        btn.disabled = false;
+                        btn.innerHTML = 'Start Abliteration';
+                        successAlert.textContent = `Abliteration complete! Output saved to: ${data.result.output_path}`;
+                        successAlert.classList.add('show');
+                        fetchModels(); // Refresh model list
+                        fetchAbliteratedModels(); // Refresh abliterated models list
+                        fetchSystemInfo(); // Update memory stats
+
+                        // Update test and compare fields with the newly abliterated model
+                        document.getElementById('test-model-path').value = data.result.output_path;
+                        document.getElementById('abliterated-model').value = data.result.output_path;
+                        document.getElementById('base-model').value = document.getElementById('model-path').value;
+
+                        // Show GGUF export card if tools are available
+                        lastAbliteratedPath = data.result.output_path;
+                        if (ggufToolsAvailable) {
+                            document.getElementById('gguf-export-card').style.display = 'block';
+                            document.getElementById('gguf-model-path').value = data.result.output_path;
+                        }
+                    } else if (data.status === 'error') {
+                        eventSource.close();
+                        btn.disabled = false;
+                        btn.innerHTML = 'Start Abliteration';
+                        errorAlert.textContent = data.error || data.message;
+                        errorAlert.classList.add('show');
+                    }
+                };
+
+                eventSource.onerror = () => {
+                    eventSource.close();
+                    btn.disabled = false;
+                    btn.innerHTML = 'Start Abliteration';
+                    errorAlert.textContent = 'Connection lost';
+                    errorAlert.classList.add('show');
+                };
+
+            } catch (e) {
+                btn.disabled = false;
+                btn.innerHTML = 'Start Abliteration';
+                errorAlert.textContent = e.message;
+                errorAlert.classList.add('show');
+            }
+        });
+
+        // Test form
+        document.getElementById('test-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const btn = document.getElementById('test-btn');
+            const errorAlert = document.getElementById('test-error');
+            const stats = document.getElementById('test-stats');
+            const resultsList = document.getElementById('test-results-list');
+
+            errorAlert.classList.remove('show');
+            stats.style.display = 'none';
+            resultsList.innerHTML = '';
+
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span> Testing...';
+
+            const prompts = document.getElementById('test-prompts').value
+                .split('\n')
+                .map(p => p.trim())
+                .filter(p => p);
+
+            try {
+                const res = await fetch('/api/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model_path: document.getElementById('test-model-path').value,
+                        prompts: prompts,
+                        max_tokens: parseInt(document.getElementById('test-max-tokens').value),
+                    }),
+                });
+
+                const data = await res.json();
+
+                if (!data.success) {
+                    throw new Error(data.error);
+                }
+
+                // Show stats
+                const total = data.results.length;
+                const refused = data.results.filter(r => r.refused).length;
+                document.getElementById('test-total').textContent = total;
+                document.getElementById('test-refused').textContent = refused;
+                document.getElementById('test-rate').textContent = `${Math.round(data.refusal_rate * 100)}%`;
+                stats.style.display = 'grid';
+
+                // Show results
+                resultsList.innerHTML = data.results.map(r => `
+                    <div class="result-item">
+                        <div class="result-header">
+                            <span class="result-prompt">${escapeHtml(r.prompt)}</span>
+                            <span class="result-badge ${r.refused ? 'refused' : 'allowed'}">
+                                ${r.refused ? 'Refused' : 'Allowed'}
+                            </span>
+                        </div>
+                        <div class="result-response">${escapeHtml(r.response)}</div>
+                    </div>
+                `).join('');
+
+                fetchSystemInfo(); // Update memory stats
+
+            } catch (e) {
+                errorAlert.textContent = e.message;
+                errorAlert.classList.add('show');
+            }
+
+            btn.disabled = false;
+            btn.innerHTML = 'Run Test';
+        });
+
+        // Compare form
+        document.getElementById('compare-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const btn = document.getElementById('compare-btn');
+            const errorAlert = document.getElementById('compare-error');
+            const results = document.getElementById('compare-results');
+
+            errorAlert.classList.remove('show');
+            results.style.display = 'none';
+
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span> Comparing...';
+
+            try {
+                const res = await fetch('/api/compare', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        base_model: document.getElementById('base-model').value,
+                        abliterated_model: document.getElementById('abliterated-model').value,
+                        prompt: document.getElementById('compare-prompt').value,
+                        max_tokens: parseInt(document.getElementById('compare-max-tokens').value),
+                    }),
+                });
+
+                const data = await res.json();
+
+                if (!data.success) {
+                    throw new Error(data.error);
+                }
+
+                // Show results
+                document.getElementById('base-response').textContent = data.base_response;
+                document.getElementById('abliterated-response').textContent = data.abliterated_response;
+
+                const baseBadge = document.getElementById('base-badge');
+                baseBadge.textContent = data.base_refused ? 'Refused' : 'Allowed';
+                baseBadge.className = `result-badge ${data.base_refused ? 'refused' : 'allowed'}`;
+
+                const ablBadge = document.getElementById('abliterated-badge');
+                ablBadge.textContent = data.abliterated_refused ? 'Refused' : 'Allowed';
+                ablBadge.className = `result-badge ${data.abliterated_refused ? 'refused' : 'allowed'}`;
+
+                results.style.display = 'block';
+
+                fetchSystemInfo(); // Update memory stats
+
+            } catch (e) {
+                errorAlert.textContent = e.message;
+                errorAlert.classList.add('show');
+            }
+
+            btn.disabled = false;
+            btn.innerHTML = 'Compare Responses';
+        });
+
+        // Utility
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchSystemInfo();
+            fetchModels();
+            fetchAbliteratedModels();
+            checkGgufTools();
+
+            // Poll system info every 5 seconds
+            systemInfoInterval = setInterval(fetchSystemInfo, 5000);
+
+            // Setup model suggestions for all inputs
+            setupModelSuggestions('model-path', 'model-suggestions');
+            setupModelSuggestions('test-model-path', 'test-model-suggestions');
+            setupModelSuggestions('base-model', 'base-model-suggestions');
+            setupModelSuggestions('abliterated-model', 'abliterated-model-suggestions');
+
+            // Auto-generate output path when model path changes
+            const modelPathInput = document.getElementById('model-path');
+            const outputPathInput = document.getElementById('output-path');
+
+            modelPathInput.addEventListener('input', updateOutputPath);
+            modelPathInput.addEventListener('change', updateOutputPath);
+
+            // Track if user manually modified output path
+            outputPathInput.addEventListener('input', () => {
+                outputPathInput.dataset.userModified = 'true';
+            });
+
+            // Generate initial output path with default directory
+            outputPathInput.value = './abliterated_models/';
+
+            // GGUF Export button (Abliterate tab)
+            document.getElementById('export-gguf-btn').addEventListener('click', () => {
+                const modelPath = document.getElementById('gguf-model-path').value;
+                const quantType = document.getElementById('gguf-quant-type').value;
+                const btn = document.getElementById('export-gguf-btn');
+
+                btn.disabled = true;
+                btn.innerHTML = '<span class="spinner"></span> Exporting...';
+
+                exportToGguf(
+                    modelPath,
+                    quantType,
+                    'gguf-progress-fill',
+                    'gguf-progress-text',
+                    'gguf-success',
+                    'gguf-error',
+                    () => {
+                        btn.disabled = false;
+                        btn.innerHTML = 'Export to GGUF';
+                    }
+                );
+            });
+
+            // Test tab export button - show/hide export section
+            document.getElementById('test-export-gguf-btn').addEventListener('click', () => {
+                const section = document.getElementById('test-gguf-section');
+                section.style.display = section.style.display === 'none' ? 'block' : 'none';
+            });
+
+            // Test tab cancel export button
+            document.getElementById('test-cancel-export-btn').addEventListener('click', () => {
+                document.getElementById('test-gguf-section').style.display = 'none';
+            });
+
+            // Test tab start export button
+            document.getElementById('test-start-export-btn').addEventListener('click', () => {
+                const modelPath = document.getElementById('test-model-path').value;
+                const quantType = document.getElementById('test-gguf-quant-type').value;
+                const btn = document.getElementById('test-start-export-btn');
+
+                if (!modelPath) {
+                    alert('Please enter a model path first');
+                    return;
+                }
+
+                btn.disabled = true;
+                btn.innerHTML = '<span class="spinner"></span> Exporting...';
+
+                exportToGguf(
+                    modelPath,
+                    quantType,
+                    'test-gguf-progress-fill',
+                    'test-gguf-progress-text',
+                    'test-gguf-success',
+                    'test-gguf-error',
+                    () => {
+                        btn.disabled = false;
+                        btn.innerHTML = 'Start Export';
+                    }
+                );
+            });
+        });
+    </script>
+</body>
+</html>

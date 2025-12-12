@@ -1,0 +1,6 @@
+/abliterated_models/*
+__pycache__/
+*.pyc
+instance
+.claude/
+CLAUDE.md
