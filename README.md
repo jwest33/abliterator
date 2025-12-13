@@ -1,5 +1,7 @@
 # Abliterator
 
+![abliterator cli](cli_example.jpg)
+
 ## Norm-Preserving Orthogonal Projection Abliteration
 
 This toolkit removes refusal behavior from language models using **norm-preserving orthogonal projection**. It computes refusal directions from contrastive prompt pairs (harmful vs harmless) and projects them out of all linear layer weights while maintaining the original Frobenius norm of each weight matrix.
@@ -25,38 +27,50 @@ This preserves the model's activation magnitudes while removing the specific dir
 ## Installation
 
 ```bash
-pip install -r requirements.txt
-```
+# Install as package (recommended)
+pip install -e .
 
-Or manually:
-```bash
-pip install torch transformers flask tqdm psutil
+# Or install dependencies only
+pip install -r requirements.txt
 ```
 
 For GGUF export functionality, you also need [llama.cpp](https://github.com/ggerganov/llama.cpp) installed with `convert_hf_to_gguf.py` and `llama-quantize` available on your PATH.
 
 ## Quick Start
 
-### Basic Usage
+### Interactive CLI (Recommended)
+
+```bash
+# Launch interactive mode with visual UI
+abliterate
+```
+
+The interactive CLI provides:
+- Visual progress tracking with Rich UI
+- Model browser for easy selection
+- Step-by-step configuration
+- Testing and comparison tools
+
+### Batch Mode
 
 ```bash
 # Using default prompts
-python abliterate.py \
+abliterate --batch \
     --model_path /path/to/your/model \
     --output_path /path/to/output
 
-# With custom prompts
-python abliterate.py \
+# With custom settings
+abliterate --batch \
     --model_path /path/to/your/model \
     --output_path /path/to/output \
-    --harmful_prompts example_harmful_prompts.json \
-    --harmless_prompts example_harmless_prompts.json
+    --num_prompts 50 \
+    --direction_multiplier 0.8
 ```
 
 ### Python API
 
 ```python
-from abliteration import AbliterationConfig, run_abliteration
+from src.abliterate import AbliterationConfig, run_abliteration
 
 config = AbliterationConfig(
     model_path="/path/to/model",
@@ -100,39 +114,21 @@ model, tokenizer = run_abliteration(config)
 ## Testing the Abliterated Model
 
 ```bash
-# Test single model
-python test_abliterate.py \
-    --model_path /path/to/abliterated/model
+# Refusal rate evaluation
+python -m utils.test_abliteration eval --model_path /path/to/model --limit 50
 
 # Compare original vs abliterated
-python test_abliterate.py \
+python -m utils.test_abliteration compare \
     --model_path /path/to/abliterated/model \
-    --original_path /path/to/original/model \
-    --output results.json
+    --original_path /path/to/original/model
+
+# Test single model
+python -m utils.test_abliteration test --model_path /path/to/model
 ```
 
-## Web Interface
-
-A Flask-based web interface provides a visual way to run abliteration, test models, and compare results.
-
-```bash
-python app.py
-# Opens on http://localhost:5000
-```
-
-### Features
-
-- **Abliterate Tab**: Configure and run abliteration with real-time progress tracking
-- **Test Tab**: Test any model with custom prompts and see refusal detection results
-- **Compare Tab**: Side-by-side comparison of base vs abliterated model responses
-- **System Monitoring**: Live GPU/RAM usage display
-- **Model Caching**: Loaded models are cached for faster subsequent inference
-
-### GGUF Export
+## GGUF Export
 
 Export abliterated models to GGUF format for use with llama.cpp, Ollama, LM Studio, and other inference engines.
-
-After abliteration completes, an "Export to GGUF" option appears with quantization choices:
 
 | Type | Bits | Description |
 |------|------|-------------|
@@ -144,11 +140,6 @@ After abliteration completes, an "Export to GGUF" option appears with quantizati
 **Requirements**: llama.cpp tools must be installed:
 - `convert_hf_to_gguf.py` - Converts HuggingFace models to GGUF
 - `llama-quantize` - Quantizes GGUF files
-
-The export process:
-1. Converts the HuggingFace model to F16 GGUF
-2. Quantizes to the selected type (if not F16)
-3. Saves as `{model-name}-{quant-type}.gguf` in the model directory
 
 ## Prompt File Format
 
@@ -189,7 +180,7 @@ Target specific layers where refusal is most prominent:
 
 ```bash
 # Only abliterate layers 10-20
-python abliterate.py \
+abliterate --batch \
     --model_path ./model \
     --output_path ./output \
     --target_layers 10 11 12 13 14 15 16 17 18 19 20
@@ -201,10 +192,10 @@ Save time by reusing computed directions:
 
 ```bash
 # First run saves directions automatically
-python abliterate.py --model_path ./model --output_path ./output1
+abliterate --batch --model_path ./model --output_path ./output1
 
 # Subsequent runs can load them
-python abliterate.py \
+abliterate --batch \
     --model_path ./model \
     --output_path ./output2 \
     --load_directions ./output1/refusal_directions.pt \
@@ -213,12 +204,11 @@ python abliterate.py \
 
 ## Output Files
 
-The script saves:
+The abliteration process saves:
 - `config.json` / `model.safetensors` - The modified model
 - `tokenizer.json` / `tokenizer_config.json` - Tokenizer files
 - `refusal_directions.pt` - Computed refusal directions (reusable)
 - `abliteration_config.json` - Configuration for reproducibility
-- `{model-name}-{quant}.gguf` - GGUF export (if exported via web interface)
 
 ## How It Works
 

@@ -4,3 +4,9 @@ __pycache__/
 instance
 .claude/
 CLAUDE.md
+NOTES.md
+venv/*
+.env
+lm-evaluation-harness/
+eval_results/*
+abliteration.egg-info
