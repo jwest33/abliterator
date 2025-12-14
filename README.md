@@ -4,6 +4,8 @@
 
 ## Norm-Preserving Orthogonal Projection Abliteration
 
+Inspired by (but admittedly less sophisticated then): [Norm-Preserving Biprojected Abliteration by Jim Lai](https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration)
+
 This toolkit removes refusal behavior from language models using **norm-preserving orthogonal projection**. It computes refusal directions from contrastive prompt pairs (harmful vs harmless) and projects them out of all linear layer weights while maintaining the original Frobenius norm of each weight matrix.
 
 ## Overview
