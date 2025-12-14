@@ -43,11 +43,13 @@ from src.cli_components import (
     display_warning,
     find_models,
     get_config_path,
+    get_eval_results_dir,
     get_model_paths,
     load_config,
     print_divider,
     remove_model_path,
     save_config,
+    set_eval_results_dir,
 )
 
 # Questionary custom style (orange theme)
@@ -392,6 +394,10 @@ def run_evaluation(model_path: str = None):
         style=custom_style,
     ).ask())
 
+    # Get configured eval results directory
+    eval_output_dir = get_eval_results_dir()
+    console.print(f"[{THEME['muted']}]Results will be saved to: {eval_output_dir}[/{THEME['muted']}]\n")
+
     from utils.test_abliteration import eval_refusal_rates
 
     results = eval_refusal_rates(
@@ -399,6 +405,7 @@ def run_evaluation(model_path: str = None):
         harmful_prompts_path=get_default_prompts_path("harmful.txt"),
         harmless_prompts_path=get_default_prompts_path("harmless.txt"),
         limit=limit,
+        output_dir=eval_output_dir,
     )
 
     # Display summary
@@ -424,6 +431,9 @@ def run_evaluation(model_path: str = None):
     )
 
     console.print(table)
+
+    # Show where results were saved
+    console.print(f"\n[{THEME['muted']}]Full results saved to: {eval_output_dir}[/{THEME['muted']}]")
 
 
 def run_compare_models():
@@ -529,6 +539,7 @@ def run_settings():
             "What would you like to do?",
             choices=[
                 questionary.Choice("Manage model directories", value="model_paths"),
+                questionary.Choice("Change eval results directory", value="eval_dir"),
                 questionary.Choice("View all settings", value="view"),
                 questionary.Choice("Reset to defaults", value="reset"),
                 questionary.Choice("Clear GPU cache", value="clear_cache"),
@@ -542,6 +553,9 @@ def run_settings():
 
         elif action == "model_paths":
             _manage_model_paths()
+
+        elif action == "eval_dir":
+            _manage_eval_results_dir()
 
         elif action == "view":
             config = load_config()
@@ -634,6 +648,35 @@ def _manage_model_paths():
                     display_error("Failed to remove path.")
 
 
+def _manage_eval_results_dir():
+    """Manage evaluation results directory."""
+    current_dir = get_eval_results_dir()
+
+    console.print(f"\n[bold {THEME['primary']}]Evaluation Results Directory[/bold {THEME['primary']}]\n")
+    console.print(f"Current directory: [{THEME['primary']}]{current_dir}[/{THEME['primary']}]")
+
+    exists = Path(current_dir).exists()
+    status = f"[green]exists[/green]" if exists else f"[yellow]will be created[/yellow]"
+    console.print(f"Status: {status}\n")
+
+    change = questionary.confirm(
+        "Change the evaluation results directory?",
+        default=False,
+        style=custom_style,
+    ).ask()
+
+    if change:
+        new_path = questionary.path(
+            "Enter new evaluation results directory:",
+            default=current_dir,
+            style=custom_style,
+        ).ask()
+
+        if new_path:
+            set_eval_results_dir(new_path)
+            display_success(f"Eval results directory set to: {new_path}")
+
+
 def is_first_run() -> bool:
     """Check if this is the first time running the CLI."""
     return not get_config_path().exists()
@@ -713,8 +756,27 @@ def run_first_time_setup():
         if output_dir:
             config["default_output_dir"] = output_dir
 
+    # Eval results directory
+    console.print(f"\n[bold {THEME['primary']}]Step 3: Evaluation Results Directory[/bold {THEME['primary']}]\n")
+    console.print(f"[{THEME['muted']}]All refusal evaluations will be logged to this directory.[/{THEME['muted']}]\n")
+
+    use_default_eval = questionary.confirm(
+        f"Use default eval results directory? ({config['eval_results_dir']})",
+        default=True,
+        style=custom_style,
+    ).ask()
+
+    if not use_default_eval:
+        eval_dir = questionary.path(
+            "Enter evaluation results directory:",
+            only_directories=True,
+            style=custom_style,
+        ).ask()
+        if eval_dir:
+            config["eval_results_dir"] = eval_dir
+
     # Default precision
-    console.print(f"\n[bold {THEME['primary']}]Step 3: Default Precision[/bold {THEME['primary']}]\n")
+    console.print(f"\n[bold {THEME['primary']}]Step 4: Default Precision[/bold {THEME['primary']}]\n")
 
     config["default_dtype"] = questionary.select(
         "Select default precision for abliteration:",

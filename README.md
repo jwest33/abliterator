@@ -45,11 +45,31 @@ For GGUF export functionality, you also need [llama.cpp](https://github.com/gger
 abliterate
 ```
 
+On first run, a setup wizard guides you through configuration:
+- **Model directories**: Where to find your models
+- **Output directory**: Default location for abliterated models
+- **Eval results directory**: Where evaluation logs are saved
+- **Precision**: Default dtype for processing (float16/bfloat16/float32)
+
 The interactive CLI provides:
 - Visual progress tracking with Rich UI
 - Model browser for easy selection
-- Step-by-step configuration
-- Testing and comparison tools
+- Step-by-step abliteration configuration
+- Model testing and comparison tools
+- Full refusal rate evaluation with logging
+- GGUF export for llama.cpp compatibility
+- Settings management
+
+### Main Menu Options
+
+| Option | Description |
+|--------|-------------|
+| **Abliterate Model** | Remove refusal behavior from a model |
+| **Test Model** | Quick test with sample prompts or custom input |
+| **Compare Models** | Side-by-side comparison of original vs abliterated |
+| **Evaluate Refusal** | Full statistical evaluation on harmful/harmless prompts |
+| **Export to GGUF** | Quantize for llama.cpp, Ollama, LM Studio |
+| **Settings** | Manage directories and configuration |
 
 ### Batch Mode
 
@@ -111,7 +131,26 @@ model, tokenizer = run_abliteration(config)
 | `--device` | cuda or cpu | cuda if available |
 | `--dtype` | float16, bfloat16, float32 | float32 |
 
-## Testing the Abliterated Model
+## Testing & Evaluation
+
+### Interactive Testing (via CLI)
+
+The CLI provides multiple testing options:
+
+- **Quick test**: Run 5 default prompts and see responses with refusal detection
+- **Custom prompt**: Enter any prompt and see the model's response
+- **Full evaluation**: Statistical analysis against harmful and harmless prompt sets
+
+### Refusal Rate Evaluation
+
+The evaluation mode tests the model against both harmful and harmless prompts:
+
+- **Harmful prompts**: Measures how often the model refuses (lower = more abliterated)
+- **Harmless prompts**: Measures false positive refusals (lower = better)
+
+All evaluation results are automatically logged to JSON files in your configured eval results directory (default: `./eval_results`).
+
+### Command Line Testing
 
 ```bash
 # Refusal rate evaluation
@@ -125,6 +164,17 @@ python -m utils.test_abliteration compare \
 # Test single model
 python -m utils.test_abliteration test --model_path /path/to/model
 ```
+
+## Settings & Configuration
+
+Configuration is stored in `~/.abliterate/config.json` and can be managed through the Settings menu:
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| Model directories | Paths searched for models | D:/models, C:/models, HuggingFace cache |
+| Output directory | Default save location for abliterated models | ./abliterated_models |
+| Eval results directory | Where evaluation logs are saved | ./eval_results |
+| Default precision | dtype for model processing | float16 |
 
 ## GGUF Export
 
@@ -210,6 +260,9 @@ The abliteration process saves:
 - `refusal_directions.pt` - Computed refusal directions (reusable)
 - `abliteration_config.json` - Configuration for reproducibility
 
+Evaluation results are saved as timestamped JSON files:
+- `{model_name}-refusal-eval_{timestamp}.json` - Full evaluation metrics and raw results
+
 ## How It Works
 
 ### Mathematical Foundation
@@ -249,18 +302,21 @@ Norm preservation maintains the original weight "magnitude" while only changing 
 ## Troubleshooting
 
 ### CUDA Out of Memory
-- Reduce `--batch_size` 
+- Reduce `--batch_size`
 - Use `--dtype float16`
 - Process on CPU with `--device cpu` (slower)
 
 ### Model Architecture Not Supported
-The script handles common architectures (Llama, GPT-NeoX, GPT-2, etc.). For custom architectures, you may need to modify `ActivationExtractor._get_layers()`.
+The script handles common architectures (Llama, GPT-NeoX, GPT-2, Qwen, etc.). For custom architectures, you may need to modify `ActivationExtractor._get_layers()`.
 
 ### Weak Ablation Effect
 - Increase number of contrastive prompts (30+ recommended)
 - Try different `--extraction_layers`
 - Increase `--direction_multiplier` to 1.2-1.5
 - Use `--token_position mean` instead of `last`
+
+### High False Positive Rate in Evaluation
+The refusal detection uses context-aware heuristics that look for refusal patterns at the start of responses. If you see unexpected results, check the raw results in the JSON output files.
 
 ## License
 

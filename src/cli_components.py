@@ -45,6 +45,7 @@ def get_default_config() -> dict:
             "./abliterated_models",
         ],
         "default_output_dir": "./abliterated_models",
+        "eval_results_dir": "./eval_results",
         "default_num_prompts": 30,
         "default_direction_multiplier": 1.0,
         "default_dtype": "float16",
@@ -107,6 +108,19 @@ def get_model_paths() -> list[str]:
     """Get the list of configured model search paths."""
     config = load_config()
     return config.get("model_paths", get_default_config()["model_paths"])
+
+
+def get_eval_results_dir() -> str:
+    """Get the configured evaluation results directory."""
+    config = load_config()
+    return config.get("eval_results_dir", get_default_config()["eval_results_dir"])
+
+
+def set_eval_results_dir(path: str) -> None:
+    """Set the evaluation results directory."""
+    config = load_config()
+    config["eval_results_dir"] = str(Path(path).resolve())
+    save_config(config)
 
 
 # =============================================================================
