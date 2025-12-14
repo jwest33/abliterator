@@ -24,6 +24,8 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.abliterate import get_default_prompts_path
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -680,14 +682,14 @@ Examples:
     eval_parser.add_argument(
         "--harmful_prompts",
         type=str,
-        default="./prompts/harmful.txt",
-        help="Path to harmful prompts file (default: ./prompts/harmful.txt)",
+        default=get_default_prompts_path("harmful.txt"),
+        help="Path to harmful prompts file (default: <package>/prompts/harmful.txt)",
     )
     eval_parser.add_argument(
         "--harmless_prompts",
         type=str,
-        default="./prompts/harmless.txt",
-        help="Path to harmless prompts file (default: ./prompts/harmless.txt)",
+        default=get_default_prompts_path("harmless.txt"),
+        help="Path to harmless prompts file (default: <package>/prompts/harmless.txt)",
     )
     eval_parser.add_argument(
         "--output_dir", "-o",

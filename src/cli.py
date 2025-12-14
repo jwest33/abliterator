@@ -24,6 +24,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
+from src.abliterate import get_default_prompts_path
 from src.cli_components import (
     THEME,
     clear_screen,
@@ -43,14 +44,14 @@ from src.cli_components import (
     print_divider,
 )
 
-# Questionary custom style
+# Questionary custom style (orange theme)
 custom_style = QStyle([
-    ("qmark", "fg:#ff00ff bold"),
+    ("qmark", "fg:#ff8c00 bold"),
     ("question", "fg:#00ffff bold"),
-    ("answer", "fg:#ff00ff bold"),
-    ("pointer", "fg:#ff00ff bold"),
-    ("highlighted", "fg:#ff00ff bold"),
-    ("selected", "fg:#00ffff"),
+    ("answer", "fg:#ff8c00 bold"),
+    ("pointer", "fg:#ff8c00 bold"),
+    ("highlighted", "fg:#ff8c00 bold"),
+    ("selected", "fg:#ffa500"),
     ("separator", "fg:#6c6c6c"),
     ("instruction", "fg:#6c6c6c"),
 ])
@@ -214,11 +215,11 @@ def run_abliteration(config: dict) -> bool:
             # Load prompts
             progress.update(task, description="Loading prompts...")
             harmful_prompts = load_prompts_from_file(
-                "./prompts/harmful.txt",
+                get_default_prompts_path("harmful.txt"),
                 num_prompts=None if config["filter_prompts"] else config["num_prompts"]
             )
             harmless_prompts = load_prompts_from_file(
-                "./prompts/harmless.txt",
+                get_default_prompts_path("harmless.txt"),
                 config["num_prompts"]
             )
             progress.advance(task, 10)
@@ -393,8 +394,8 @@ def run_evaluation(model_path: str = None):
 
     results = eval_refusal_rates(
         model_path=model_path,
-        harmful_prompts_path="./prompts/harmful.txt",
-        harmless_prompts_path="./prompts/harmless.txt",
+        harmful_prompts_path=get_default_prompts_path("harmful.txt"),
+        harmless_prompts_path=get_default_prompts_path("harmless.txt"),
         limit=limit,
     )
 

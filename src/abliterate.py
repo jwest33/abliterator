@@ -39,6 +39,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_package_root() -> Path:
+    """Get the root directory of the abliteration package.
+
+    This allows the CLI to be invoked from anywhere and still find
+    the prompts directory correctly on both Windows and Unix systems.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+def get_default_prompts_path(filename: str) -> str:
+    """Get the absolute path to a prompts file.
+
+    Args:
+        filename: Name of the prompts file (e.g., 'harmful.txt')
+
+    Returns:
+        Absolute path to the prompts file as a string
+    """
+    return str(get_package_root() / "prompts" / filename)
+
+
 # Data Classes
 
 
@@ -48,8 +69,8 @@ class AbliterationConfig:
 
     model_path: str
     output_path: str
-    harmful_prompts_path: str = "./prompts/harmful.txt"
-    harmless_prompts_path: str = "./prompts/harmless.txt"
+    harmful_prompts_path: str = field(default_factory=lambda: get_default_prompts_path("harmful.txt"))
+    harmless_prompts_path: str = field(default_factory=lambda: get_default_prompts_path("harmless.txt"))
     num_prompts: Optional[int] = None  # Number of prompts to sample (None = use all)
     harmful_prompts: list[str] = field(default_factory=list)
     harmless_prompts: list[str] = field(default_factory=list)
@@ -852,14 +873,14 @@ Examples:
     parser.add_argument(
         "--harmful_prompts",
         type=str,
-        default="./prompts/harmful.txt",
-        help="Path to JSON or text file with harmful prompts (default: ./prompts/harmful.txt)",
+        default=get_default_prompts_path("harmful.txt"),
+        help="Path to JSON or text file with harmful prompts (default: <package>/prompts/harmful.txt)",
     )
     parser.add_argument(
         "--harmless_prompts",
         type=str,
-        default="./prompts/harmless.txt",
-        help="Path to JSON or text file with harmless prompts (default: ./prompts/harmless.txt)",
+        default=get_default_prompts_path("harmless.txt"),
+        help="Path to JSON or text file with harmless prompts (default: <package>/prompts/harmless.txt)",
     )
     parser.add_argument(
         "--num_prompts",
