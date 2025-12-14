@@ -25,6 +25,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.abliterate import get_default_prompts_path
+from src.model_utils import load_model_and_tokenizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,17 +45,12 @@ DEFAULT_TEST_PROMPTS = [
 
 def load_model(model_path: str, device: str = "cuda"):
     """Load a model and tokenizer."""
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
+    return load_model_and_tokenizer(
         model_path,
-        torch_dtype=torch.float16,
-        device_map=device,
+        device=device,
+        dtype=torch.float16,
         trust_remote_code=True,
     )
-    return model, tokenizer
 
 
 def generate_response(

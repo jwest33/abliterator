@@ -30,6 +30,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.model_utils import load_model_and_tokenizer
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -147,10 +149,22 @@ class ActivationExtractor:
         """Get the transformer layers from the model."""
         # Handle different model architectures
         if hasattr(self.model, "model"):
+            # Vision-Language models (Qwen2-VL, Qwen3-VL, LLaVA, etc.)
+            # Structure: model.model.model.layers (VL wrapper -> multimodal -> text -> layers)
+            if hasattr(self.model.model, "model") and hasattr(self.model.model.model, "layers"):
+                return self.model.model.model.layers
+            # Standard text models (Llama, Qwen, etc.)
+            # Structure: model.model.layers
             if hasattr(self.model.model, "layers"):
                 return self.model.model.layers
             elif hasattr(self.model.model, "decoder") and hasattr(self.model.model.decoder, "layers"):
                 return self.model.model.decoder.layers
+        # VL models with language_model attribute (some LLaVA variants, InternVL, etc.)
+        if hasattr(self.model, "language_model"):
+            if hasattr(self.model.language_model, "model") and hasattr(self.model.language_model.model, "layers"):
+                return self.model.language_model.model.layers
+            if hasattr(self.model.language_model, "layers"):
+                return self.model.language_model.layers
         if hasattr(self.model, "transformer"):
             if hasattr(self.model.transformer, "h"):
                 return self.model.transformer.h
@@ -158,7 +172,37 @@ class ActivationExtractor:
                 return self.model.transformer.layers
         if hasattr(self.model, "gpt_neox") and hasattr(self.model.gpt_neox, "layers"):
             return self.model.gpt_neox.layers
-        raise ValueError(f"Could not find layers in model architecture: {type(self.model)}")
+
+        # Debug: print model structure to help identify the correct path
+        structure_info = self._get_model_structure_info()
+        raise ValueError(
+            f"Could not find layers in model architecture: {type(self.model)}\n"
+            f"Model structure:\n{structure_info}\n"
+            f"Please add support for this architecture in ActivationExtractor._get_layers()"
+        )
+
+    def _get_model_structure_info(self, max_depth: int = 3) -> str:
+        """Get a string representation of the model's top-level structure for debugging."""
+        lines = []
+
+        def explore(obj, prefix="", depth=0):
+            if depth >= max_depth:
+                return
+            for name in dir(obj):
+                if name.startswith("_"):
+                    continue
+                try:
+                    attr = getattr(obj, name)
+                    if isinstance(attr, torch.nn.ModuleList):
+                        lines.append(f"{prefix}{name}: ModuleList[{len(attr)}]")
+                    elif isinstance(attr, torch.nn.Module):
+                        lines.append(f"{prefix}{name}: {type(attr).__name__}")
+                        explore(attr, prefix + "  ", depth + 1)
+                except Exception:
+                    pass
+
+        explore(self.model)
+        return "\n".join(lines[:50])  # Limit output
 
     def _create_hook(self, layer_idx: int):
         """Create a forward hook for a specific layer."""
@@ -742,17 +786,12 @@ def run_abliteration(config: AbliterationConfig):
 
     # Load model and tokenizer first (needed for refusal filtering)
     logger.info(f"Loading model from {config.model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(config.model_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
+    model, tokenizer = load_model_and_tokenizer(
         config.model_path,
-        torch_dtype=config.dtype,
-        device_map=config.device,
+        device=config.device,
+        dtype=config.dtype,
         trust_remote_code=True,
     )
-    logger.info(f"Model loaded: {type(model).__name__}")
 
     # Load prompts from files
     # For harmful prompts with filtering: load ALL prompts as a pool, then filter to target count

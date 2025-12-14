@@ -193,7 +193,7 @@ def run_abliteration(config: dict) -> bool:
         filter_harmful_prompts_by_refusal,
         load_prompts_from_file,
     )
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from src.model_utils import load_model_and_tokenizer
 
     dtype_map = {
         "float16": torch.float16,
@@ -226,17 +226,13 @@ def run_abliteration(config: dict) -> bool:
 
             # Load model
             progress.update(task, description="Loading model and tokenizer...")
-            tokenizer = AutoTokenizer.from_pretrained(config["model_path"], trust_remote_code=True)
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-            tokenizer.padding_side = "left"
-
-            model = AutoModelForCausalLM.from_pretrained(
+            model, tokenizer = load_model_and_tokenizer(
                 config["model_path"],
-                torch_dtype=dtype_map[config["dtype"]],
-                device_map=config["device"],
+                device=config["device"],
+                dtype=dtype_map[config["dtype"]],
                 trust_remote_code=True,
             )
+            tokenizer.padding_side = "left"
             progress.advance(task, 20)
 
             # Create config
