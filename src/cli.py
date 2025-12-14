@@ -25,6 +25,15 @@ from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from src.abliterate import get_default_prompts_path
+from src.gguf_export import (
+    GGUFExportConfig,
+    QUANT_TYPES,
+    check_tools_available,
+    detect_vision_model,
+    export_to_gguf,
+    find_llama_cpp_path,
+    has_vision_files,
+)
 from src.cli_components import (
     THEME,
     add_model_path,
@@ -288,6 +297,15 @@ def run_abliteration(config: dict) -> bool:
             tokenizer.save_pretrained(output_path)
             directions.save(str(output_path / "refusal_directions.pt"))
 
+            # Copy vision files for VL models (needed for GGUF mmproj export)
+            from src.abliterate import is_vision_model, copy_vision_files
+            source_path = Path(config["model_path"])
+            if is_vision_model(source_path):
+                progress.update(task, description="Copying vision encoder files...")
+                copied_files = copy_vision_files(source_path, output_path)
+                if copied_files:
+                    console.print(f"[{THEME['muted']}]Copied {len(copied_files)} vision files[/{THEME['muted']}]")
+
             # Save config
             config_save = {
                 "model_path": config["model_path"],
@@ -496,25 +514,168 @@ def run_gguf_export():
     """Interactive GGUF export workflow."""
     console.print(f"\n[bold {THEME['primary']}]Export to GGUF[/bold {THEME['primary']}]\n")
 
+    # Check tool availability first
+    config = load_config()
+    llama_cpp_path = config.get("llama_cpp_path")
+    if llama_cpp_path:
+        llama_cpp_path = Path(llama_cpp_path)
+
+    tools_status = check_tools_available(llama_cpp_path)
+
+    if not tools_status["can_convert"]:
+        display_error(
+            "GGUF export requires llama.cpp tools which were not found.\n\n"
+            "Please ensure one of the following:\n"
+            "  1. Set LLAMA_CPP_PATH environment variable to your llama.cpp directory\n"
+            "  2. Configure llama_cpp_path in Settings\n"
+            "  3. Add convert_hf_to_gguf.py to your PATH\n\n"
+            "Install llama.cpp from: https://github.com/ggerganov/llama.cpp"
+        )
+
+        # Offer to configure llama.cpp path
+        configure = questionary.confirm(
+            "Would you like to configure the llama.cpp path now?",
+            default=True,
+            style=custom_style,
+        ).ask()
+
+        if configure:
+            new_path = questionary.path(
+                "Enter path to llama.cpp directory:",
+                style=custom_style,
+            ).ask()
+
+            if new_path and Path(new_path).exists():
+                config["llama_cpp_path"] = str(Path(new_path).resolve())
+                save_config(config)
+                display_success(f"Saved llama.cpp path: {new_path}")
+
+                # Re-check tools
+                tools_status = check_tools_available(Path(new_path))
+                if not tools_status["can_convert"]:
+                    display_error("Still could not find convert_hf_to_gguf.py in that directory.")
+                    return
+            else:
+                return
+        else:
+            return
+
+    # Show tool status
+    console.print(f"[{THEME['muted']}]Convert script: {tools_status['convert_script']}[/{THEME['muted']}]")
+    if tools_status["quantize_exe"]:
+        console.print(f"[{THEME['muted']}]Quantize tool: {tools_status['quantize_exe']}[/{THEME['muted']}]")
+    else:
+        console.print(f"[{THEME['warning']}]Quantize tool not found - only F16/F32 export available[/{THEME['warning']}]")
+    console.print()
+
+    # Select model
     model_path = select_model("Select model to export:")
     if not model_path:
         return
 
+    # Detect if this is a VL model
+    is_vl_model, vl_arch = detect_vision_model(Path(model_path))
+    original_model_path = None  # For mmproj conversion if needed
+
+    if is_vl_model:
+        console.print(f"[{THEME['accent']}]Detected Vision-Language model[/{THEME['accent']}]" +
+                      (f" ({vl_arch})" if vl_arch else ""))
+
+        # Check if this model has vision files for mmproj
+        if has_vision_files(Path(model_path)):
+            console.print(f"[{THEME['muted']}]mmproj file will be created for vision encoder[/{THEME['muted']}]")
+        else:
+            console.print(f"[{THEME['warning']}]Vision encoder files not found in this model directory[/{THEME['warning']}]")
+            console.print(f"[{THEME['muted']}]This appears to be an abliterated model without the original vision files.[/{THEME['muted']}]")
+            console.print()
+
+            # Ask for original model path
+            provide_original = questionary.confirm(
+                "Would you like to provide the original model path for mmproj export?",
+                default=True,
+                style=custom_style,
+            ).ask()
+
+            if provide_original:
+                original_model_path = questionary.path(
+                    "Enter path to original model (with vision files):",
+                    style=custom_style,
+                ).ask()
+
+                if original_model_path and Path(original_model_path).exists():
+                    if has_vision_files(Path(original_model_path)):
+                        console.print(f"[{THEME['success']}]Found vision files in original model[/{THEME['success']}]")
+                    else:
+                        console.print(f"[{THEME['warning']}]Original model also missing vision files[/{THEME['warning']}]")
+                        original_model_path = None
+                else:
+                    original_model_path = None
+
+            if not original_model_path:
+                console.print(f"[{THEME['muted']}]Continuing without mmproj - vision features will not work[/{THEME['muted']}]")
+
+        console.print()
+
+    # Build quantization choices based on available tools
+    quant_choices = [
+        questionary.Choice("Q4_K_M - 4-bit k-quant medium (recommended)", value="Q4_K_M"),
+        questionary.Choice("Q5_K_M - 5-bit k-quant medium (higher quality)", value="Q5_K_M"),
+        questionary.Choice("Q8_0 - 8-bit (near-lossless)", value="Q8_0"),
+        questionary.Choice("Q6_K - 6-bit k-quant (good for larger models)", value="Q6_K"),
+        questionary.Choice("Q3_K_M - 3-bit k-quant (aggressive compression)", value="Q3_K_M"),
+        questionary.Choice("F16 - 16-bit float (no quantization)", value="F16"),
+    ]
+
+    # If quantize tool not available, only offer F16/F32
+    if not tools_status["can_quantize"]:
+        quant_choices = [
+            questionary.Choice("F16 - 16-bit float", value="F16"),
+            questionary.Choice("F32 - 32-bit float", value="F32"),
+        ]
+
     quant_type = questionary.select(
         "Select quantization type:",
-        choices=[
-            questionary.Choice("Q4_K_M (recommended, good balance)", value="Q4_K_M"),
-            questionary.Choice("Q5_K_M (higher quality)", value="Q5_K_M"),
-            questionary.Choice("Q8_0 (near-lossless)", value="Q8_0"),
-            questionary.Choice("F16 (no quantization)", value="F16"),
-        ],
+        choices=quant_choices,
         style=custom_style,
     ).ask()
 
-    display_warning(
-        "GGUF export requires llama.cpp tools (convert_hf_to_gguf.py and llama-quantize).\n"
-        "Make sure these are installed and available in your PATH."
-    )
+    if not quant_type:
+        return
+
+    # Select output directory
+    default_output = config.get("default_output_dir", "./abliterated_models")
+    output_dir = questionary.path(
+        "Output directory:",
+        default=default_output,
+        style=custom_style,
+    ).ask()
+
+    if not output_dir:
+        return
+
+    output_dir = Path(output_dir)
+
+    # Optional: custom model name
+    model_name = Path(model_path).name
+    custom_name = questionary.text(
+        "Output filename prefix (leave empty for default):",
+        default="",
+        style=custom_style,
+    ).ask()
+
+    if custom_name:
+        model_name = custom_name
+
+    # Confirm
+    console.print(f"\n[bold]Export Configuration:[/bold]")
+    console.print(f"  Model: [{THEME['primary']}]{model_path}[/{THEME['primary']}]")
+    console.print(f"  Output: [{THEME['primary']}]{output_dir}[/{THEME['primary']}]")
+    console.print(f"  Format: [{THEME['accent']}]{quant_type}[/{THEME['accent']}]")
+    console.print(f"  Name: [{THEME['primary']}]{model_name}[/{THEME['primary']}]")
+    if is_vl_model:
+        console.print(f"  Type: [{THEME['accent']}]Vision-Language (VL) model[/{THEME['accent']}]")
+        console.print(f"  mmproj: [{THEME['muted']}]Will be exported automatically[/{THEME['muted']}]")
+    console.print()
 
     proceed = questionary.confirm(
         "Proceed with export?",
@@ -525,9 +686,70 @@ def run_gguf_export():
     if not proceed:
         return
 
-    # This would call the actual GGUF export logic from app.py
-    console.print(f"\n[{THEME['muted']}]GGUF export would run here with {quant_type} quantization...[/{THEME['muted']}]")
-    display_warning("GGUF export is currently only available through the web interface.")
+    # Run the export
+    console.print()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Exporting to GGUF...", total=None)
+
+        def progress_callback(msg: str):
+            progress.update(task, description=msg)
+
+        export_config = GGUFExportConfig(
+            model_path=Path(model_path),
+            output_dir=output_dir,
+            quant_type=quant_type,
+            llama_cpp_path=llama_cpp_path,
+            model_name=model_name,
+            is_vision_model=is_vl_model,
+            original_model_path=Path(original_model_path) if original_model_path else None,
+        )
+
+        success, message, output_path = export_to_gguf(
+            config=export_config,
+            progress_callback=progress_callback,
+        )
+
+    console.print()
+    if success:
+        display_success(message)
+        if output_path and output_path.exists():
+            size_gb = output_path.stat().st_size / (1024**3)
+            console.print(f"  Model size: [{THEME['accent']}]{size_gb:.2f} GB[/{THEME['accent']}]")
+
+        # Check for mmproj file for VL models
+        # The --mmproj flag adds "mmproj-" prefix to the output filename
+        if is_vl_model:
+            mmproj_patterns = [
+                output_dir / f"mmproj-{model_name}-f16.gguf",  # Main pattern from --mmproj flag
+                output_dir / f"{model_name}-mmproj-f16.gguf",  # Alternative naming
+            ]
+            mmproj_found = False
+            for mmproj_path in mmproj_patterns:
+                if mmproj_path.exists():
+                    size_mb = mmproj_path.stat().st_size / (1024**2)
+                    console.print(f"  mmproj size: [{THEME['accent']}]{size_mb:.1f} MB[/{THEME['accent']}]")
+                    console.print(f"  mmproj path: [{THEME['muted']}]{mmproj_path}[/{THEME['muted']}]")
+                    mmproj_found = True
+                    break
+
+            if not mmproj_found:
+                # Check for any mmproj file in output directory
+                for f in output_dir.glob("*mmproj*.gguf"):
+                    size_mb = f.stat().st_size / (1024**2)
+                    console.print(f"  mmproj size: [{THEME['accent']}]{size_mb:.1f} MB[/{THEME['accent']}]")
+                    console.print(f"  mmproj path: [{THEME['muted']}]{f}[/{THEME['muted']}]")
+                    mmproj_found = True
+                    break
+
+            if not mmproj_found:
+                console.print(f"  [{THEME['warning']}]mmproj not found - vision features may not work[/{THEME['warning']}]")
+                console.print(f"  [{THEME['muted']}]You may need to manually convert the vision encoder[/{THEME['muted']}]")
+    else:
+        display_error(message)
 
 
 def run_settings():
@@ -540,6 +762,7 @@ def run_settings():
             choices=[
                 questionary.Choice("Manage model directories", value="model_paths"),
                 questionary.Choice("Change eval results directory", value="eval_dir"),
+                questionary.Choice("Configure llama.cpp path (GGUF export)", value="llama_cpp"),
                 questionary.Choice("View all settings", value="view"),
                 questionary.Choice("Reset to defaults", value="reset"),
                 questionary.Choice("Clear GPU cache", value="clear_cache"),
@@ -556,6 +779,9 @@ def run_settings():
 
         elif action == "eval_dir":
             _manage_eval_results_dir()
+
+        elif action == "llama_cpp":
+            _manage_llama_cpp_path()
 
         elif action == "view":
             config = load_config()
@@ -675,6 +901,89 @@ def _manage_eval_results_dir():
         if new_path:
             set_eval_results_dir(new_path)
             display_success(f"Eval results directory set to: {new_path}")
+
+
+def _manage_llama_cpp_path():
+    """Manage llama.cpp installation path for GGUF export."""
+    config = load_config()
+    current_path = config.get("llama_cpp_path", "")
+
+    console.print(f"\n[bold {THEME['primary']}]llama.cpp Path (GGUF Export)[/bold {THEME['primary']}]\n")
+
+    if current_path:
+        console.print(f"Current path: [{THEME['primary']}]{current_path}[/{THEME['primary']}]")
+        exists = Path(current_path).exists()
+        status = f"[green]exists[/green]" if exists else f"[red]not found[/red]"
+        console.print(f"Status: {status}")
+    else:
+        console.print(f"[{THEME['muted']}]No path configured (will search common locations)[/{THEME['muted']}]")
+
+    # Check current tool detection
+    tools_status = check_tools_available(Path(current_path) if current_path else None)
+    console.print()
+
+    if tools_status["can_convert"]:
+        console.print(f"[green]✓[/green] Convert script found: {tools_status['convert_script']}")
+    else:
+        console.print(f"[red]✗[/red] Convert script not found")
+
+    if tools_status["can_quantize"]:
+        console.print(f"[green]✓[/green] Quantize tool found: {tools_status['quantize_exe']}")
+    else:
+        console.print(f"[yellow]![/yellow] Quantize tool not found (only F16/F32 export available)")
+
+    console.print()
+
+    action = questionary.select(
+        "What would you like to do?",
+        choices=[
+            questionary.Choice("Set llama.cpp path", value="set"),
+            questionary.Choice("Auto-detect llama.cpp", value="auto"),
+            questionary.Choice("Clear path (use auto-detection)", value="clear"),
+            questionary.Choice("Back", value="back"),
+        ],
+        style=custom_style,
+    ).ask()
+
+    if action == "back" or action is None:
+        return
+
+    elif action == "set":
+        new_path = questionary.path(
+            "Enter path to llama.cpp directory:",
+            default=current_path or "",
+            style=custom_style,
+        ).ask()
+
+        if new_path:
+            new_path = str(Path(new_path).resolve())
+            config["llama_cpp_path"] = new_path
+            save_config(config)
+
+            # Verify
+            tools = check_tools_available(Path(new_path))
+            if tools["can_convert"]:
+                display_success(f"llama.cpp path set to: {new_path}")
+            else:
+                display_warning(f"Path set, but convert_hf_to_gguf.py not found in {new_path}")
+
+    elif action == "auto":
+        detected = find_llama_cpp_path()
+        if detected:
+            config["llama_cpp_path"] = str(detected)
+            save_config(config)
+            display_success(f"Auto-detected llama.cpp at: {detected}")
+        else:
+            display_warning(
+                "Could not auto-detect llama.cpp installation.\n"
+                "Try setting the path manually or set LLAMA_CPP_PATH environment variable."
+            )
+
+    elif action == "clear":
+        if "llama_cpp_path" in config:
+            del config["llama_cpp_path"]
+            save_config(config)
+        display_success("Path cleared. Will use auto-detection.")
 
 
 def is_first_run() -> bool:

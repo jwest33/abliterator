@@ -219,7 +219,7 @@ def test_refusal_rate(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=dtype_map.get(dtype, torch.float16),
+        dtype=dtype_map.get(dtype, torch.float16),
         device_map=device,
         trust_remote_code=True,
     )

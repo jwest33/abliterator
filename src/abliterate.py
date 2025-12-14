@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +61,117 @@ def get_default_prompts_path(filename: str) -> str:
         Absolute path to the prompts file as a string
     """
     return str(get_package_root() / "prompts" / filename)
+
+
+def copy_vision_files(source_path: Path, dest_path: Path) -> list[str]:
+    """Copy vision-related files from source model to destination.
+
+    This is needed for Vision-Language (VL) models so that the abliterated
+    model can still be converted to GGUF with mmproj support.
+
+    Args:
+        source_path: Path to the original model directory
+        dest_path: Path to the abliterated model directory
+
+    Returns:
+        List of filenames that were copied
+    """
+    # Files needed for VL model vision encoder conversion
+    vision_files = [
+        "preprocessor_config.json",
+        "processor_config.json",
+        "image_processor_config.json",
+        "chat_template.json",
+        # Vision encoder weights (if stored separately)
+        "vision_encoder.safetensors",
+        "vision_model.safetensors",
+        "visual.safetensors",
+        # Qwen VL specific
+        "mrope_sections.txt",
+    ]
+
+    # Also copy any files with "vision" or "image" in the name
+    vision_patterns = ["*vision*", "*image*", "*visual*", "*processor*"]
+
+    copied_files = []
+    source_path = Path(source_path)
+    dest_path = Path(dest_path)
+
+    # Copy specific vision files
+    for filename in vision_files:
+        src_file = source_path / filename
+        if src_file.exists():
+            dst_file = dest_path / filename
+            if not dst_file.exists():
+                shutil.copy2(src_file, dst_file)
+                copied_files.append(filename)
+                logger.debug(f"Copied vision file: {filename}")
+
+    # Copy files matching vision patterns
+    for pattern in vision_patterns:
+        for src_file in source_path.glob(pattern):
+            if src_file.is_file():
+                dst_file = dest_path / src_file.name
+                if not dst_file.exists():
+                    shutil.copy2(src_file, dst_file)
+                    copied_files.append(src_file.name)
+                    logger.debug(f"Copied vision file: {src_file.name}")
+
+    return copied_files
+
+
+def is_vision_model(model_path: Path) -> bool:
+    """Check if a model is a Vision-Language model based on config.
+
+    Args:
+        model_path: Path to the model directory
+
+    Returns:
+        True if the model appears to be a VL model
+    """
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        # Fall back to name-based detection
+        model_name_lower = model_path.name.lower()
+        return any(kw in model_name_lower for kw in ["vl", "vision", "llava", "visual"])
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        # Check for VL architectures
+        vl_architectures = [
+            "Qwen2VLForConditionalGeneration",
+            "Qwen2_5_VLForConditionalGeneration",
+            "Qwen3VLForConditionalGeneration",
+            "LlavaForConditionalGeneration",
+            "LlavaNextForConditionalGeneration",
+            "MllamaForConditionalGeneration",
+            "InternVLChatModel",
+            "PaliGemmaForConditionalGeneration",
+            "Idefics2ForConditionalGeneration",
+            "MiniCPMV",
+            "Phi3VForCausalLM",
+        ]
+
+        architectures = config.get("architectures", [])
+        for arch in architectures:
+            if arch in vl_architectures:
+                return True
+
+        # Check for vision_config
+        if "vision_config" in config or "visual" in config:
+            return True
+
+        # Check model_type
+        model_type = config.get("model_type", "").lower()
+        if any(kw in model_type for kw in ["vl", "vision", "llava"]):
+            return True
+
+    except (json.JSONDecodeError, IOError):
+        pass
+
+    return False
 
 
 # Data Classes
@@ -846,6 +958,16 @@ def run_abliteration(config: AbliterationConfig):
 
     model.save_pretrained(output_path, safe_serialization=True)
     tokenizer.save_pretrained(output_path)
+
+    # Copy vision files for VL models (needed for GGUF mmproj export)
+    source_path = Path(config.model_path)
+    if is_vision_model(source_path):
+        logger.info("Detected Vision-Language model, copying vision encoder files...")
+        copied_files = copy_vision_files(source_path, output_path)
+        if copied_files:
+            logger.info(f"Copied {len(copied_files)} vision-related files: {', '.join(copied_files)}")
+        else:
+            logger.warning("No vision files found to copy")
 
     # Save config for reproducibility
     config_save = {

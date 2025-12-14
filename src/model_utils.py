@@ -115,7 +115,7 @@ def load_model_and_tokenizer(
 
             model = AutoModelForImageTextToText.from_pretrained(
                 model_path,
-                torch_dtype=dtype,
+                dtype=dtype,
                 device_map=device,
                 trust_remote_code=trust_remote_code,
             )
@@ -128,7 +128,7 @@ def load_model_and_tokenizer(
         logger.info(f"Loading model with AutoModelForCausalLM...")
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=dtype,
+            dtype=dtype,
             device_map=device,
             trust_remote_code=trust_remote_code,
         )
