@@ -27,6 +27,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from src.abliterate import get_default_prompts_path
 from src.cli_components import (
     THEME,
+    add_model_path,
     clear_screen,
     console,
     create_progress_bar,
@@ -41,7 +42,12 @@ from src.cli_components import (
     display_system_info,
     display_warning,
     find_models,
+    get_config_path,
+    get_model_paths,
+    load_config,
     print_divider,
+    remove_model_path,
+    save_config,
 )
 
 # Questionary custom style (orange theme)
@@ -516,31 +522,229 @@ def run_gguf_export():
 
 def run_settings():
     """Settings management."""
-    console.print(f"\n[bold {THEME['primary']}]Settings[/bold {THEME['primary']}]\n")
+    while True:
+        console.print(f"\n[bold {THEME['primary']}]Settings[/bold {THEME['primary']}]\n")
 
-    action = questionary.select(
-        "What would you like to do?",
-        choices=[
-            questionary.Choice("View current settings", value="view"),
-            questionary.Choice("Clear model cache", value="clear_cache"),
-            questionary.Choice("Back", value="back"),
-        ],
+        action = questionary.select(
+            "What would you like to do?",
+            choices=[
+                questionary.Choice("Manage model directories", value="model_paths"),
+                questionary.Choice("View all settings", value="view"),
+                questionary.Choice("Reset to defaults", value="reset"),
+                questionary.Choice("Clear GPU cache", value="clear_cache"),
+                questionary.Choice("Back", value="back"),
+            ],
+            style=custom_style,
+        ).ask()
+
+        if action == "back" or action is None:
+            break
+
+        elif action == "model_paths":
+            _manage_model_paths()
+
+        elif action == "view":
+            config = load_config()
+            console.print(f"\n[bold]Config file:[/bold] {get_config_path()}\n")
+            display_config_panel(config, "Current Settings")
+
+        elif action == "reset":
+            confirm = questionary.confirm(
+                "Reset all settings to defaults?",
+                default=False,
+                style=custom_style,
+            ).ask()
+            if confirm:
+                from src.cli_components import get_default_config
+                save_config(get_default_config())
+                display_success("Settings reset to defaults!")
+
+        elif action == "clear_cache":
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            display_success("GPU cache cleared!")
+
+
+def _manage_model_paths():
+    """Manage model search directories."""
+    while True:
+        paths = get_model_paths()
+
+        console.print(f"\n[bold {THEME['primary']}]Model Search Directories[/bold {THEME['primary']}]\n")
+
+        # Display current paths
+        from rich.table import Table
+        table = Table(show_header=True, header_style=f"bold {THEME['primary']}")
+        table.add_column("#", style="dim", width=4)
+        table.add_column("Path", style=THEME["primary"])
+        table.add_column("Status", style=THEME["muted"])
+
+        for idx, path in enumerate(paths, 1):
+            exists = Path(path).exists()
+            status = "[green]exists[/green]" if exists else "[red]not found[/red]"
+            table.add_row(str(idx), path, status)
+
+        console.print(table)
+        console.print()
+
+        action = questionary.select(
+            "What would you like to do?",
+            choices=[
+                questionary.Choice("Add a directory", value="add"),
+                questionary.Choice("Remove a directory", value="remove"),
+                questionary.Choice("Back", value="back"),
+            ],
+            style=custom_style,
+        ).ask()
+
+        if action == "back" or action is None:
+            break
+
+        elif action == "add":
+            new_path = questionary.path(
+                "Enter directory path:",
+                only_directories=True,
+                style=custom_style,
+            ).ask()
+
+            if new_path:
+                if add_model_path(new_path):
+                    display_success(f"Added: {new_path}")
+                else:
+                    display_warning("Path already in list.")
+
+        elif action == "remove":
+            if not paths:
+                display_warning("No paths to remove.")
+                continue
+
+            choices = [questionary.Choice(p, value=p) for p in paths]
+            choices.append(questionary.Choice("Cancel", value=None))
+
+            to_remove = questionary.select(
+                "Select path to remove:",
+                choices=choices,
+                style=custom_style,
+            ).ask()
+
+            if to_remove:
+                if remove_model_path(to_remove):
+                    display_success(f"Removed: {to_remove}")
+                else:
+                    display_error("Failed to remove path.")
+
+
+def is_first_run() -> bool:
+    """Check if this is the first time running the CLI."""
+    return not get_config_path().exists()
+
+
+def run_first_time_setup():
+    """First-time setup walkthrough for new users."""
+    clear_screen()
+    display_banner()
+
+    from rich.panel import Panel
+
+    console.print(Panel(
+        "[bold]Welcome to the Abliteration Toolkit![/bold]\n\n"
+        "This appears to be your first time running the CLI.\n"
+        "Let's set up your configuration.",
+        title="[bold cyan]First-Time Setup[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+    console.print()
+
+    # Ask about model directories
+    console.print(f"[bold {THEME['primary']}]Step 1: Model Directories[/bold {THEME['primary']}]\n")
+    console.print("The toolkit needs to know where to find your models.")
+    console.print(f"[{THEME['muted']}]Default locations: D:/models, C:/models, HuggingFace cache[/{THEME['muted']}]\n")
+
+    add_custom = questionary.confirm(
+        "Would you like to add a custom model directory?",
+        default=True,
         style=custom_style,
     ).ask()
 
-    if action == "view":
-        from src.cli_components import get_system_info
-        info = get_system_info()
-        display_config_panel(info, "System Information")
+    custom_paths = []
+    while add_custom:
+        path = questionary.path(
+            "Enter model directory path:",
+            only_directories=True,
+            style=custom_style,
+        ).ask()
 
-    elif action == "clear_cache":
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        display_success("GPU cache cleared!")
+        if path and Path(path).exists():
+            custom_paths.append(str(Path(path).resolve()))
+            display_success(f"Added: {path}")
+        elif path:
+            display_warning(f"Directory not found: {path}")
+
+        add_custom = questionary.confirm(
+            "Add another directory?",
+            default=False,
+            style=custom_style,
+        ).ask()
+
+    # Build initial config
+    from src.cli_components import get_default_config
+    config = get_default_config()
+
+    # Prepend custom paths
+    if custom_paths:
+        config["model_paths"] = custom_paths + config["model_paths"]
+
+    # Default output directory
+    console.print(f"\n[bold {THEME['primary']}]Step 2: Default Output Directory[/bold {THEME['primary']}]\n")
+
+    use_default_output = questionary.confirm(
+        f"Use default output directory? ({config['default_output_dir']})",
+        default=True,
+        style=custom_style,
+    ).ask()
+
+    if not use_default_output:
+        output_dir = questionary.path(
+            "Enter default output directory:",
+            only_directories=True,
+            style=custom_style,
+        ).ask()
+        if output_dir:
+            config["default_output_dir"] = output_dir
+
+    # Default precision
+    console.print(f"\n[bold {THEME['primary']}]Step 3: Default Precision[/bold {THEME['primary']}]\n")
+
+    config["default_dtype"] = questionary.select(
+        "Select default precision for abliteration:",
+        choices=[
+            questionary.Choice("float16 (faster, less memory)", value="float16"),
+            questionary.Choice("bfloat16 (better precision)", value="bfloat16"),
+            questionary.Choice("float32 (full precision)", value="float32"),
+        ],
+        default="float16",
+        style=custom_style,
+    ).ask()
+
+    # Save config
+    save_config(config)
+
+    console.print()
+    display_success(f"Configuration saved to: {get_config_path()}")
+    console.print(f"\n[{THEME['muted']}]You can modify these settings anytime from the Settings menu.[/{THEME['muted']}]\n")
+
+    questionary.press_any_key_to_continue(
+        "Press any key to continue to the main menu...",
+        style=custom_style,
+    ).ask()
 
 
 def main_menu():
     """Main interactive menu loop."""
+    # Check for first-time setup
+    if is_first_run():
+        run_first_time_setup()
     while True:
         clear_screen()
         display_banner()

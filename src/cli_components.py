@@ -7,13 +7,112 @@ Reusable UI components for the interactive CLI including:
 - Model selector
 - Progress callbacks
 - Results tables
+- Configuration management
 """
 
+import json
 from pathlib import Path
 from typing import Callable, Optional
 
 import psutil
 import torch
+
+
+# =============================================================================
+# Configuration Management
+# =============================================================================
+
+def get_config_dir() -> Path:
+    """Get the configuration directory path."""
+    config_dir = Path.home() / ".abliterate"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir
+
+
+def get_config_path() -> Path:
+    """Get the config file path."""
+    return get_config_dir() / "config.json"
+
+
+def get_default_config() -> dict:
+    """Return default configuration settings."""
+    return {
+        "model_paths": [
+            "D:/models",
+            "C:/models",
+            str(Path.home() / ".cache" / "huggingface" / "hub"),
+            "./",
+            "./abliterated_models",
+        ],
+        "default_output_dir": "./abliterated_models",
+        "default_num_prompts": 30,
+        "default_direction_multiplier": 1.0,
+        "default_dtype": "float16",
+    }
+
+
+def load_config() -> dict:
+    """Load configuration from file, creating defaults if needed."""
+    config_path = get_config_path()
+
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                user_config = json.load(f)
+            # Merge with defaults to ensure all keys exist
+            config = get_default_config()
+            config.update(user_config)
+            return config
+        except (json.JSONDecodeError, IOError):
+            # Return defaults if file is corrupted
+            return get_default_config()
+    else:
+        # Create config file with defaults
+        config = get_default_config()
+        save_config(config)
+        return config
+
+
+def save_config(config: dict) -> None:
+    """Save configuration to file."""
+    config_path = get_config_path()
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+
+def add_model_path(path: str) -> bool:
+    """Add a model search path to the config."""
+    config = load_config()
+    path = str(Path(path).resolve())
+
+    if path not in config["model_paths"]:
+        config["model_paths"].insert(0, path)  # Add to front for priority
+        save_config(config)
+        return True
+    return False
+
+
+def remove_model_path(path: str) -> bool:
+    """Remove a model search path from the config."""
+    config = load_config()
+
+    if path in config["model_paths"]:
+        config["model_paths"].remove(path)
+        save_config(config)
+        return True
+    return False
+
+
+def get_model_paths() -> list[str]:
+    """Get the list of configured model search paths."""
+    config = load_config()
+    return config.get("model_paths", get_default_config()["model_paths"])
+
+
+# =============================================================================
+# Rich UI Components
+# =============================================================================
+
 from rich.align import Align
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -173,15 +272,11 @@ def display_menu(title: str, options: list[tuple[str, str]], show_quit: bool = T
 
 
 def find_models(search_paths: list[Path] = None) -> list[dict]:
-    """Find available models in common locations."""
+    """Find available models in configured locations."""
     if search_paths is None:
-        search_paths = [
-            Path("D:/models"),
-            Path("C:/models"),
-            Path.home() / ".cache" / "huggingface" / "hub",
-            Path("./"),
-            Path("./abliterated_models"),
-        ]
+        # Load paths from user config
+        configured_paths = get_model_paths()
+        search_paths = [Path(p) for p in configured_paths]
 
     models = []
     seen_paths = set()
