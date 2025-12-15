@@ -2,51 +2,224 @@
 # These prompts capture activations for capabilities to preserve during abliteration
 # One prompt per line, lines starting with # are ignored
 
-# General knowledge
-What is the capital of France?
+# =============================================================================
+# STEM - PHYSICS
+# =============================================================================
+Explain Newton's three laws of motion with examples.
+What is the difference between kinetic and potential energy?
+How does electromagnetic induction work?
+Explain the concept of entropy in thermodynamics.
+What is the photoelectric effect and why was it important?
+Describe wave-particle duality in quantum mechanics.
+How do black holes form and what are their properties?
+Explain the relationship between voltage, current, and resistance.
+
+# =============================================================================
+# STEM - CHEMISTRY
+# =============================================================================
+Explain the difference between ionic and covalent bonds.
+What is electronegativity and how does it affect bonding?
+Describe the process of titration in analytical chemistry.
+What are oxidation-reduction reactions?
+Explain Le Chatelier's principle with an example.
+How do catalysts speed up chemical reactions?
+What is the difference between organic and inorganic chemistry?
+Describe the structure and properties of benzene.
+
+# =============================================================================
+# STEM - BIOLOGY & MEDICINE
+# =============================================================================
 Explain how photosynthesis works.
-Who wrote Romeo and Juliet?
-What causes the seasons on Earth?
 Describe the water cycle.
+How does the immune system fight infections?
+Explain the process of DNA replication.
+What is the difference between mitosis and meiosis?
+How do vaccines work to prevent disease?
+Describe the function of the liver in the human body.
+What are viruses and how do they differ from bacteria?
+Explain antibiotic resistance and why it's a concern.
+What is CRISPR and how does it edit genes?
 
-# Reasoning and analysis
-Compare and contrast democracy and authoritarianism.
-What are the pros and cons of renewable energy?
-Analyze the causes of World War I.
-Explain the scientific method.
-What factors should I consider when making a major decision?
-
-# Coding and technical
-Write a Python function to calculate factorial.
-Explain the difference between a list and a dictionary in Python.
-How does a binary search algorithm work?
-What is object-oriented programming?
-Explain what an API is and how it works.
-
-# Creative and writing
-Write a short poem about nature.
-Help me brainstorm ideas for a birthday party.
-Describe a peaceful forest scene.
-Write a professional email requesting time off.
-Create a simple recipe for pasta.
-
-# Math and logic
+# =============================================================================
+# STEM - MATHEMATICS
+# =============================================================================
 Solve the equation 2x + 5 = 15.
 What is the Pythagorean theorem?
 Explain probability using a coin flip example.
 How do you calculate the area of a circle?
 What is the difference between mean and median?
+Explain what a derivative represents in calculus.
+What is the fundamental theorem of algebra?
+How do you solve a system of linear equations?
+Explain the concept of mathematical proof by induction.
+What is the difference between permutations and combinations?
 
-# Helpful assistant
-How can I improve my study habits?
+# =============================================================================
+# STEM - COMPUTER SCIENCE
+# =============================================================================
+Write a Python function to calculate factorial.
+Explain the difference between a list and a dictionary in Python.
+How does a binary search algorithm work?
+What is object-oriented programming?
+Explain what an API is and how it works.
+What is the difference between stack and heap memory?
+Explain Big O notation and time complexity.
+How does a hash table work?
+What is recursion and when should you use it?
+Explain the difference between SQL and NoSQL databases.
+
+# =============================================================================
+# SOCIAL SCIENCES - ECONOMICS
+# =============================================================================
+Explain the law of supply and demand.
+What is the difference between fiscal and monetary policy?
+How does inflation affect purchasing power?
+Explain the concept of opportunity cost.
+What is GDP and how is it calculated?
+Describe the difference between microeconomics and macroeconomics.
+What causes economic recessions?
+Explain the concept of market equilibrium.
+What is comparative advantage in international trade?
+How do central banks control interest rates?
+
+# =============================================================================
+# SOCIAL SCIENCES - PSYCHOLOGY
+# =============================================================================
+Explain classical conditioning with Pavlov's experiment.
+What is cognitive dissonance?
+Describe the stages of human development according to Erikson.
+What is the difference between short-term and long-term memory?
+Explain the bystander effect in social psychology.
+What are the main symptoms of depression?
+Describe Maslow's hierarchy of needs.
+What is confirmation bias?
+Explain the difference between nature and nurture in development.
+What is emotional intelligence?
+
+# =============================================================================
+# SOCIAL SCIENCES - SOCIOLOGY & POLITICAL SCIENCE
+# =============================================================================
+Compare and contrast democracy and authoritarianism.
+What is social stratification?
+Explain the concept of cultural relativism.
+What are the main functions of government?
+Describe the difference between socialism and capitalism.
+What is the role of media in shaping public opinion?
+Explain the concept of social mobility.
+What is the separation of powers in government?
+Describe different types of electoral systems.
+What is globalization and its effects on society?
+
+# =============================================================================
+# LAW & ETHICS
+# =============================================================================
+What is the difference between civil and criminal law?
+Explain the concept of jurisdiction in legal systems.
+What are human rights according to international law?
+Describe the principle of habeas corpus.
+What is intellectual property law?
+Explain contract law basics.
+What is the difference between ethics and morality?
+Describe utilitarianism as an ethical framework.
+What is corporate social responsibility?
+Explain the concept of due process.
+
+# =============================================================================
+# HISTORY & GEOGRAPHY
+# =============================================================================
+Analyze the causes of World War I.
+What were the main causes of the French Revolution?
+Describe the Renaissance and its impact on Europe.
+What was the Cold War and how did it end?
+Explain the significance of the Industrial Revolution.
+What is the capital of France?
+What causes the seasons on Earth?
+Describe the major climate zones of Earth.
+What is plate tectonics and how does it shape continents?
+Explain the significance of the Silk Road in history.
+What were the causes and effects of the Protestant Reformation?
+Describe the main events of the Russian Revolution.
+
+# =============================================================================
+# HUMANITIES - PHILOSOPHY & RELIGION
+# =============================================================================
+Who wrote Romeo and Juliet?
+Explain Plato's Allegory of the Cave.
+What is existentialism?
+Describe the main beliefs of Buddhism.
+What is the difference between empiricism and rationalism?
+Explain Kant's categorical imperative.
+What are the five pillars of Islam?
+Describe the Socratic method of inquiry.
+What is the problem of evil in philosophy of religion?
+Explain the concept of karma in Hinduism.
+
+# =============================================================================
+# HUMANITIES - LANGUAGE & LITERATURE
+# =============================================================================
+What are the major themes in Shakespeare's Hamlet?
+Explain the difference between simile and metaphor.
+What is the hero's journey narrative structure?
+Describe the characteristics of Romantic literature.
+What is the difference between active and passive voice?
+Explain irony and its types in literature.
+What makes an argument logically valid?
+Describe the structure of a sonnet.
+What is stream of consciousness in writing?
+Explain the difference between deductive and inductive reasoning.
+
+# =============================================================================
+# HEALTH & NUTRITION
+# =============================================================================
 What are some tips for better sleep?
-How do I start learning a new language?
 Suggest some healthy breakfast options.
-How can I be more productive at work?
+How can I improve my study habits?
+Explain the importance of hydration for health.
+What are macronutrients and micronutrients?
+How does exercise benefit mental health?
+What is the recommended daily calorie intake?
+Explain the role of fiber in digestion.
+What are the effects of chronic stress on the body?
+How can I maintain a healthy work-life balance?
 
-# Complex multi-step
+# =============================================================================
+# PRACTICAL SKILLS & GENERAL KNOWLEDGE
+# =============================================================================
+How can I be more productive at work?
 Plan a week-long trip to Japan including must-see attractions.
 Explain how to start a small business step by step.
 Create a workout routine for a beginner.
 How do I write a good resume?
 Explain machine learning to a 10-year-old.
+How do I start learning a new language?
+What factors should I consider when making a major decision?
+How do I manage personal finances effectively?
+What are the basics of public speaking?
+
+# =============================================================================
+# CREATIVE & COMMUNICATION
+# =============================================================================
+Write a short poem about nature.
+Help me brainstorm ideas for a birthday party.
+Describe a peaceful forest scene.
+Write a professional email requesting time off.
+Create a simple recipe for pasta.
+How do I write a compelling story opening?
+What makes an effective presentation?
+Explain the principles of good design.
+How do I give constructive feedback?
+What are techniques for creative brainstorming?
+
+# =============================================================================
+# REASONING & ANALYSIS
+# =============================================================================
+What are the pros and cons of renewable energy?
+Explain the scientific method.
+How do you evaluate the credibility of a source?
+What is critical thinking and why is it important?
+Explain correlation versus causation.
+How do you identify logical fallacies in arguments?
+What is the difference between qualitative and quantitative research?
+Explain how to analyze a complex problem systematically.
+What is Occam's Razor?
+How do you make decisions under uncertainty?

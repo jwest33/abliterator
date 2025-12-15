@@ -11,6 +11,7 @@ Reusable UI components for the interactive CLI including:
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -121,6 +122,56 @@ def set_eval_results_dir(path: str) -> None:
     config = load_config()
     config["eval_results_dir"] = str(Path(path).resolve())
     save_config(config)
+
+
+def get_versioned_path(path: Path | str) -> Path:
+    """
+    Get a versioned path if the original path already exists.
+
+    If the path doesn't exist, returns it unchanged.
+    If the path exists, appends _v2, _v3, etc. until finding an available name.
+
+    Examples:
+        ./output -> ./output (if doesn't exist)
+        ./output -> ./output_v2 (if ./output exists)
+        ./output -> ./output_v3 (if ./output and ./output_v2 exist)
+
+    Args:
+        path: The desired output path
+
+    Returns:
+        Path: The original path or a versioned variant that doesn't exist
+    """
+    path = Path(path)
+
+    if not path.exists():
+        return path
+
+    # Path exists, find next available version
+    base_name = path.name
+    parent = path.parent
+
+    # Check if the name already has a version suffix
+    version_match = re.match(r'^(.+)_v(\d+)$', base_name)
+    if version_match:
+        # Already versioned, increment from that version
+        base_name = version_match.group(1)
+        start_version = int(version_match.group(2)) + 1
+    else:
+        start_version = 2
+
+    # Find next available version
+    version = start_version
+    while True:
+        versioned_name = f"{base_name}_v{version}"
+        versioned_path = parent / versioned_name
+        if not versioned_path.exists():
+            return versioned_path
+        version += 1
+
+        # Safety limit to prevent infinite loop
+        if version > 1000:
+            raise ValueError(f"Too many versions of {base_name} exist (>1000)")
 
 
 # =============================================================================

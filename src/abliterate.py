@@ -29,6 +29,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.model_utils import load_model_and_tokenizer
+from src.cli_components import get_versioned_path
 
 # Configure logging
 logging.basicConfig(
@@ -1141,9 +1142,11 @@ def run_abliteration(config: AbliterationConfig):
     # Apply abliteration
     model = abliterate_model(model, directions, config, null_space_projector)
 
-    # Save the modified model
-    logger.info(f"Saving abliterated model to {config.output_path}...")
-    output_path = Path(config.output_path)
+    # Save the modified model (with version suffix if path already exists)
+    output_path = get_versioned_path(config.output_path)
+    if output_path != Path(config.output_path):
+        logger.info(f"Output path exists, using versioned path: {output_path}")
+    logger.info(f"Saving abliterated model to {output_path}...")
     output_path.mkdir(parents=True, exist_ok=True)
 
     model.save_pretrained(output_path, safe_serialization=True)
@@ -1183,7 +1186,7 @@ def run_abliteration(config: AbliterationConfig):
 
     logger.info("=" * 60)
     logger.info("Abliteration complete!")
-    logger.info(f"Output saved to: {config.output_path}")
+    logger.info(f"Output saved to: {output_path}")
     logger.info("=" * 60)
 
     return model, tokenizer

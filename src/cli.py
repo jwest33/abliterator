@@ -54,6 +54,7 @@ from src.cli_components import (
     get_config_path,
     get_eval_results_dir,
     get_model_paths,
+    get_versioned_path,
     load_config,
     print_divider,
     remove_model_path,
@@ -386,9 +387,11 @@ def run_abliteration(config: dict) -> bool:
             model = abliterate_model(model, directions, abl_config, null_space_projector)
             progress.advance(task, 15)
 
-            # Save model
+            # Save model (with version suffix if path already exists)
             progress.update(task, description="Saving abliterated model...")
-            output_path = Path(config["output_path"])
+            output_path = get_versioned_path(config["output_path"])
+            if output_path != Path(config["output_path"]):
+                console.print(f"[{THEME['warning']}]Output path exists, using: {output_path.name}[/{THEME['warning']}]")
             output_path.mkdir(parents=True, exist_ok=True)
 
             model.save_pretrained(output_path, safe_serialization=True)
@@ -428,7 +431,7 @@ def run_abliteration(config: dict) -> bool:
 
             progress.advance(task, 10)
 
-        display_success(f"Model abliterated successfully!\n\nOutput saved to: {config['output_path']}")
+        display_success(f"Model abliterated successfully!\n\nOutput saved to: {output_path}")
         return True
 
     except Exception as e:
