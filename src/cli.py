@@ -4,10 +4,6 @@ Interactive CLI for Abliteration Toolkit
 
 A modern terminal interface for removing refusal behavior from language models.
 Supports interactive mode (default) and batch mode for automation.
-
-Usage:
-    python -m src.cli              # Interactive mode
-    python -m src.cli --batch ...  # Batch mode (legacy CLI)
 """
 
 import json
