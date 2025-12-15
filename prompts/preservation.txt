@@ -1,0 +1,52 @@
+# Preservation prompts for null-space constrained abliteration
+# These prompts capture activations for capabilities to preserve during abliteration
+# One prompt per line, lines starting with # are ignored
+
+# General knowledge
+What is the capital of France?
+Explain how photosynthesis works.
+Who wrote Romeo and Juliet?
+What causes the seasons on Earth?
+Describe the water cycle.
+
+# Reasoning and analysis
+Compare and contrast democracy and authoritarianism.
+What are the pros and cons of renewable energy?
+Analyze the causes of World War I.
+Explain the scientific method.
+What factors should I consider when making a major decision?
+
+# Coding and technical
+Write a Python function to calculate factorial.
+Explain the difference between a list and a dictionary in Python.
+How does a binary search algorithm work?
+What is object-oriented programming?
+Explain what an API is and how it works.
+
+# Creative and writing
+Write a short poem about nature.
+Help me brainstorm ideas for a birthday party.
+Describe a peaceful forest scene.
+Write a professional email requesting time off.
+Create a simple recipe for pasta.
+
+# Math and logic
+Solve the equation 2x + 5 = 15.
+What is the Pythagorean theorem?
+Explain probability using a coin flip example.
+How do you calculate the area of a circle?
+What is the difference between mean and median?
+
+# Helpful assistant
+How can I improve my study habits?
+What are some tips for better sleep?
+How do I start learning a new language?
+Suggest some healthy breakfast options.
+How can I be more productive at work?
+
+# Complex multi-step
+Plan a week-long trip to Japan including must-see attractions.
+Explain how to start a small business step by step.
+Create a workout routine for a beginner.
+How do I write a good resume?
+Explain machine learning to a 10-year-old.

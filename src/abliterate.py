@@ -203,6 +203,7 @@ class AbliterationConfig:
     token_position: str = "last"  # Which token position to extract: "last", "mean", or int
     filter_harmful_prompts: bool = True  # Filter out harmful prompts that aren't actually refused
     refusal_test_max_tokens: int = 50  # Max tokens to generate when testing for refusal
+    refusal_test_batch_size: int = 16  # Batch size for refusal testing (larger = faster but more VRAM)
     refusal_keywords: list[str] = field(default_factory=lambda: [
         "I cannot", "I can't", "I'm not able", "I am not able",
         "I won't", "I will not", "I'm unable", "I am unable",
@@ -213,6 +214,21 @@ class AbliterationConfig:
         "cannot help", "can't help", "cannot provide", "can't provide",
         "not able to help", "not able to assist", "not able to provide",
     ])
+
+    # Advanced options: Winsorization (clips outlier activations)
+    use_winsorization: bool = False  # Enable Winsorization preprocessing
+    winsorize_percentile: float = 0.995  # Clip values above this percentile
+
+    # Advanced options: Null-space constraints (preserves model capabilities)
+    use_null_space: bool = False  # Enable null-space constrained abliteration
+    preservation_prompts_path: Optional[str] = None  # Path to preservation prompts file
+    null_space_rank_ratio: float = 0.95  # SVD rank ratio for null-space computation
+    null_space_regularization: float = 1e-4  # Tikhonov regularization for numerical stability
+
+    # Advanced options: Adaptive layer weighting
+    use_adaptive_weighting: bool = False  # Enable per-layer adaptive weighting
+    adaptive_position_center: float = 0.6  # Center of Gaussian position weighting (0-1)
+    adaptive_position_sigma: float = 0.2  # Width of Gaussian position weighting
 
 
 @dataclass
@@ -410,6 +426,81 @@ class ActivationExtractor:
         return result
 
 
+# Adaptive Layer Weighting
+
+
+def compute_adaptive_layer_weights(
+    num_layers: int,
+    center: float = 0.6,
+    sigma: float = 0.2,
+    min_weight: float = 0.1,
+) -> dict[int, float]:
+    """
+    Compute adaptive weights for each layer using a Gaussian distribution.
+
+    Research shows refusal behavior is more concentrated in middle-to-later layers.
+    This function assigns higher weights to layers around the specified center
+    position, allowing the ablation to be stronger where it matters most.
+
+    Args:
+        num_layers: Total number of layers in the model
+        center: Center of the Gaussian as fraction of depth (0-1)
+        sigma: Standard deviation of the Gaussian as fraction of depth
+        min_weight: Minimum weight for any layer (to ensure all layers get some ablation)
+
+    Returns:
+        Dictionary mapping layer indices to weights (0.0 - 1.0)
+    """
+    import math
+
+    weights = {}
+    center_layer = center * (num_layers - 1)
+    sigma_layers = sigma * num_layers
+
+    for i in range(num_layers):
+        # Gaussian weight centered at center_layer
+        gaussian_weight = math.exp(-0.5 * ((i - center_layer) / sigma_layers) ** 2)
+        # Apply minimum weight floor
+        weights[i] = max(gaussian_weight, min_weight)
+
+    # Normalize so max weight is 1.0
+    max_weight = max(weights.values())
+    if max_weight > 0:
+        weights = {k: v / max_weight for k, v in weights.items()}
+
+    return weights
+
+
+# Winsorization for Outlier-Robust Direction Computation
+
+
+def winsorize_activations(
+    activations: torch.Tensor,
+    percentile: float = 0.995,
+) -> torch.Tensor:
+    """
+    Apply Winsorization to clip extreme activation values.
+
+    Critical for models like Gemma 3 where high-magnitude outliers
+    can obscure the true refusal direction.
+
+    Args:
+        activations: [num_samples, hidden_dim] activation tensor
+        percentile: Clip values above this percentile (default: 0.995)
+
+    Returns:
+        Winsorized activations with outliers clipped
+    """
+    # Compute per-dimension thresholds based on absolute values
+    abs_acts = activations.abs()
+    thresholds = torch.quantile(abs_acts.float(), percentile, dim=0)
+
+    # Clip to thresholds (both positive and negative)
+    clipped = torch.clamp(activations, -thresholds, thresholds)
+
+    return clipped
+
+
 # Refusal Direction Computation
 
 
@@ -454,6 +545,18 @@ def compute_refusal_directions(
     finally:
         extractor.remove_hooks()
 
+    # Apply Winsorization if enabled (clips outlier activations for cleaner directions)
+    if config.use_winsorization:
+        logger.info(f"Applying Winsorization (percentile={config.winsorize_percentile})...")
+        for layer_idx in harmful_activations:
+            harmful_activations[layer_idx] = winsorize_activations(
+                harmful_activations[layer_idx], config.winsorize_percentile
+            )
+        for layer_idx in harmless_activations:
+            harmless_activations[layer_idx] = winsorize_activations(
+                harmless_activations[layer_idx], config.winsorize_percentile
+            )
+
     # Compute refusal directions as mean difference
     directions = {}
     for layer_idx in extraction_layers:
@@ -485,6 +588,8 @@ def compute_refusal_directions(
         "extraction_layers": extraction_layers,
         "normalized": config.normalize_directions,
         "token_position": config.token_position,
+        "winsorized": config.use_winsorization,
+        "winsorize_percentile": config.winsorize_percentile if config.use_winsorization else None,
     }
 
     logger.info(f"Computed refusal directions for {len(directions)} layers")
@@ -616,13 +721,26 @@ def abliterate_model(
     model: AutoModelForCausalLM,
     directions: RefusalDirections,
     config: AbliterationConfig,
+    null_space_projector: Optional["NullSpaceProjector"] = None,
 ) -> AutoModelForCausalLM:
     """
     Apply norm-preserving orthogonal projection abliteration to the model.
 
     This modifies the model's weights in-place to remove refusal behavior.
+
+    Args:
+        model: The model to abliterate
+        directions: Computed refusal directions
+        config: Abliteration configuration
+        null_space_projector: Optional null-space projector for capability preservation
+
+    Returns:
+        Modified model
     """
-    logger.info("Applying norm-preserving orthogonal projection abliteration...")
+    if null_space_projector is not None:
+        logger.info("Applying null-space constrained abliteration...")
+    else:
+        logger.info("Applying norm-preserving orthogonal projection abliteration...")
 
     linear_names = get_linear_layer_names(model)
     logger.info(f"Found {len(linear_names)} linear layers")
@@ -635,6 +753,21 @@ def abliterate_model(
         # Use per-layer directions
         primary_direction = None
         logger.info("Using per-layer directions")
+
+    # Compute adaptive layer weights if enabled
+    adaptive_weights = None
+    if config.use_adaptive_weighting:
+        # Estimate number of layers from layer names
+        layer_indices = [get_layer_index_from_name(n) for n in linear_names]
+        max_layer = max((i for i in layer_indices if i is not None), default=0)
+        num_layers = max_layer + 1
+
+        adaptive_weights = compute_adaptive_layer_weights(
+            num_layers,
+            center=config.adaptive_position_center,
+            sigma=config.adaptive_position_sigma,
+        )
+        logger.info(f"Using adaptive layer weighting (center={config.adaptive_position_center:.2f})")
 
     modified_count = 0
     skipped_count = 0
@@ -672,14 +805,34 @@ def abliterate_model(
             skipped_count += 1
             continue
 
-        # Apply projection
+        # Compute effective multiplier (with adaptive weighting if enabled)
+        effective_multiplier = config.direction_multiplier
+        if adaptive_weights is not None and layer_idx is not None:
+            layer_weight = adaptive_weights.get(layer_idx, 1.0)
+            effective_multiplier = config.direction_multiplier * layer_weight
+
+        # Apply projection (with optional null-space constraint)
         try:
-            new_weight = apply_norm_preserving_projection(
-                weight,
-                direction,
-                preserve_norm=config.norm_preservation,
-                multiplier=config.direction_multiplier,
-            )
+            if null_space_projector is not None:
+                # Use null-space constrained projection
+                from src.null_space import apply_null_space_constrained_projection
+
+                null_V = null_space_projector.get_projector_for_layer(layer_idx)
+                new_weight = apply_null_space_constrained_projection(
+                    weight,
+                    direction,
+                    null_space_V=null_V,
+                    preserve_norm=config.norm_preservation,
+                    multiplier=effective_multiplier,
+                )
+            else:
+                # Standard projection
+                new_weight = apply_norm_preserving_projection(
+                    weight,
+                    direction,
+                    preserve_norm=config.norm_preservation,
+                    multiplier=effective_multiplier,
+                )
             module.weight.data = new_weight
             modified_count += 1
         except Exception as e:
@@ -746,6 +899,7 @@ def test_prompts_for_refusal_batch(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     config: AbliterationConfig,
+    show_progress: bool = False,
 ) -> list[tuple[str, bool, str]]:
     """
     Test multiple prompts for refusal in batches (much faster than one-by-one).
@@ -755,16 +909,25 @@ def test_prompts_for_refusal_batch(
         model: The model to test
         tokenizer: The tokenizer
         config: Configuration with refusal keywords and generation settings
+        show_progress: Whether to show a progress bar for batch processing
 
     Returns:
         List of (prompt, is_refused, response) tuples
     """
     model.eval()
     results = []
+    batch_size = config.refusal_test_batch_size
+
+    # Calculate total batches for progress bar
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+    batch_iter = range(0, len(prompts), batch_size)
+
+    if show_progress:
+        batch_iter = tqdm(batch_iter, total=total_batches, desc="Testing batches", leave=False)
 
     # Process in batches
-    for i in range(0, len(prompts), config.batch_size):
-        batch_prompts = prompts[i : i + config.batch_size]
+    for i in batch_iter:
+        batch_prompts = prompts[i : i + batch_size]
 
         # Format with chat template if available
         if hasattr(tokenizer, "apply_chat_template"):
@@ -787,12 +950,13 @@ def test_prompts_for_refusal_batch(
         ).to(config.device)
 
         # Generate responses for entire batch
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=config.refusal_test_max_tokens,
-            do_sample=False,  # Greedy for consistency
-            pad_token_id=tokenizer.pad_token_id,
-        )
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=config.refusal_test_max_tokens,
+                do_sample=False,  # Greedy for consistency
+                pad_token_id=tokenizer.pad_token_id,
+            )
 
         # Decode each response in the batch
         for j, (prompt, output) in enumerate(zip(batch_prompts, outputs)):
@@ -836,48 +1000,39 @@ def filter_harmful_prompts_by_refusal(
 
     refused_prompts = []
     non_refused_prompts = []
-    tested_indices = set()
+    tested_count = 0
 
-    # Shuffle indices for random sampling
-    available_indices = list(range(len(prompt_pool)))
-    random.shuffle(available_indices)
+    # Shuffle prompts for random sampling
+    shuffled_prompts = prompt_pool.copy()
+    random.shuffle(shuffled_prompts)
 
-    with tqdm(total=target_count, desc="Finding refused prompts") as pbar:
-        while len(refused_prompts) < target_count and len(tested_indices) < len(prompt_pool):
-            # Calculate how many more we need, with some buffer for non-refusals
-            needed = target_count - len(refused_prompts)
-            # Sample more than needed to account for non-refusals (estimate ~80% refusal rate)
-            sample_size = min(max(needed * 2, config.batch_size), len(prompt_pool) - len(tested_indices))
+    # Process all prompts in batches until we have enough refusals
+    batch_size = config.refusal_test_batch_size
+    total_batches = (len(shuffled_prompts) + batch_size - 1) // batch_size
 
-            # Get next batch of untested prompts
-            batch_indices = []
-            for idx in available_indices:
-                if idx not in tested_indices:
-                    batch_indices.append(idx)
-                    if len(batch_indices) >= sample_size:
-                        break
-
-            if not batch_indices:
+    with tqdm(total=total_batches, desc="Finding refused prompts", unit="batch") as pbar:
+        for i in range(0, len(shuffled_prompts), batch_size):
+            if len(refused_prompts) >= target_count:
                 break
 
-            batch_prompts = [prompt_pool[idx] for idx in batch_indices]
-            tested_indices.update(batch_indices)
-
-            # Test batch
+            batch_prompts = shuffled_prompts[i : i + batch_size]
             batch_results = test_prompts_for_refusal_batch(batch_prompts, model, tokenizer, config)
 
             for prompt, is_refused, response in batch_results:
+                tested_count += 1
                 if is_refused:
-                    if len(refused_prompts) < target_count:
-                        refused_prompts.append(prompt)
-                        pbar.update(1)
-                        logger.debug(f"REFUSED: {prompt[:50]}...")
+                    refused_prompts.append(prompt)
+                    logger.debug(f"REFUSED: {prompt[:50]}...")
                 else:
                     non_refused_prompts.append(prompt)
                     logger.debug(f"NOT REFUSED: {prompt[:50]}... -> {response[:100]}...")
 
+            # Update progress bar with batch count and show refusals found
+            pbar.update(1)
+            pbar.set_postfix({"found": f"{len(refused_prompts)}/{target_count}"})
+
     logger.info(f"Refusal filtering complete:")
-    logger.info(f"  - Prompts tested: {len(tested_indices)}")
+    logger.info(f"  - Prompts tested: {tested_count}")
     logger.info(f"  - Prompts refused: {len(refused_prompts)}")
     logger.info(f"  - Prompts NOT refused: {len(non_refused_prompts)}")
 
@@ -948,8 +1103,46 @@ def run_abliteration(config: AbliterationConfig):
             directions_path.parent.mkdir(parents=True, exist_ok=True)
             directions.save(str(directions_path))
 
+    # Compute null-space projectors if enabled (for capability preservation)
+    null_space_projector = None
+    if config.use_null_space:
+        from src.null_space import (
+            NullSpaceConfig,
+            NullSpaceProjector,
+            compute_null_space_projectors,
+            get_default_preservation_prompts_path,
+        )
+
+        preservation_path = config.preservation_prompts_path
+        if preservation_path is None:
+            preservation_path = get_default_preservation_prompts_path()
+
+        # Determine layer indices for null-space computation
+        layers = directions.directions.keys()
+        if not layers:
+            # Use extraction layers from config
+            layers = config.extraction_layer_indices or []
+
+        null_config = NullSpaceConfig(
+            preservation_prompts_path=preservation_path,
+            svd_rank_ratio=config.null_space_rank_ratio,
+            regularization=config.null_space_regularization,
+        )
+
+        logger.info("Computing null-space projectors for capability preservation...")
+        null_space_projector = compute_null_space_projectors(
+            model, tokenizer, null_config, list(layers), config.device, config.dtype
+        )
+
+        # Save projectors for reuse
+        if config.save_directions:
+            projector_path = Path(config.output_path) / "null_space_projectors.pt"
+            projector_path.parent.mkdir(parents=True, exist_ok=True)
+            null_space_projector.save(str(projector_path))
+            logger.info(f"Saved null-space projectors to {projector_path}")
+
     # Apply abliteration
-    model = abliterate_model(model, directions, config)
+    model = abliterate_model(model, directions, config, null_space_projector)
 
     # Save the modified model
     logger.info(f"Saving abliterated model to {config.output_path}...")
@@ -981,6 +1174,12 @@ def run_abliteration(config: AbliterationConfig):
         "token_position": config.token_position,
         "num_harmful_prompts": len(config.harmful_prompts),
         "num_harmless_prompts": len(config.harmless_prompts),
+        # Advanced options
+        "use_winsorization": config.use_winsorization,
+        "winsorize_percentile": config.winsorize_percentile if config.use_winsorization else None,
+        "use_null_space": config.use_null_space,
+        "null_space_rank_ratio": config.null_space_rank_ratio if config.use_null_space else None,
+        "use_adaptive_weighting": config.use_adaptive_weighting,
     }
     with open(output_path / "abliteration_config.json", "w") as f:
         json.dump(config_save, f, indent=2)
@@ -1114,6 +1313,12 @@ Examples:
         help="Batch size for activation extraction",
     )
     parser.add_argument(
+        "--refusal_test_batch_size",
+        type=int,
+        default=16,
+        help="Batch size for refusal testing (larger = faster, but more VRAM). Default: 16",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -1166,6 +1371,7 @@ Examples:
         save_directions=not args.no_save_directions,
         load_directions_path=args.load_directions,
         batch_size=args.batch_size,
+        refusal_test_batch_size=args.refusal_test_batch_size,
         token_position=token_pos,
         filter_harmful_prompts=not args.no_filter_prompts,
         refusal_test_max_tokens=args.refusal_test_tokens,

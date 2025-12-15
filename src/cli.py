@@ -198,6 +198,70 @@ def get_abliteration_config() -> Optional[dict]:
         style=custom_style,
     ).ask()
 
+    # Step 4: Advanced Options
+    console.print(f"\n[bold {THEME['primary']}]Step 4: Advanced Options[/bold {THEME['primary']}]\n")
+
+    use_advanced = questionary.confirm(
+        "Configure advanced options? (Winsorization, null-space constraints)",
+        default=False,
+        style=custom_style,
+    ).ask()
+
+    # Set defaults
+    config["use_winsorization"] = False
+    config["use_null_space"] = False
+    config["use_adaptive_weighting"] = False
+
+    if use_advanced:
+        # Winsorization (recommended for Gemma models)
+        config["use_winsorization"] = questionary.confirm(
+            "Enable Winsorization? (clips outlier activations, recommended for Gemma models)",
+            default=False,
+            style=custom_style,
+        ).ask()
+
+        if config["use_winsorization"]:
+            config["winsorize_percentile"] = float(questionary.text(
+                "Winsorize percentile (0.99-0.999):",
+                default="0.995",
+                style=custom_style,
+            ).ask())
+
+        # Null-space constraints (preserves model capabilities)
+        config["use_null_space"] = questionary.confirm(
+            "Enable null-space constraints? (preserves model capabilities)",
+            default=False,
+            style=custom_style,
+        ).ask()
+
+        if config["use_null_space"]:
+            use_default_preservation = questionary.confirm(
+                "Use default preservation prompts?",
+                default=True,
+                style=custom_style,
+            ).ask()
+
+            if use_default_preservation:
+                config["preservation_prompts_path"] = None
+            else:
+                config["preservation_prompts_path"] = questionary.path(
+                    "Path to custom preservation prompts:",
+                    style=custom_style,
+                ).ask()
+
+            config["null_space_rank_ratio"] = float(questionary.text(
+                "Null-space SVD rank ratio (0.9-0.99):",
+                default="0.95",
+                style=custom_style,
+            ).ask())
+
+        # Adaptive layer weighting
+        config["use_adaptive_weighting"] = questionary.confirm(
+            "Enable adaptive layer weighting?",
+            default=False,
+            style=custom_style,
+        ).ask()
+
     return config
 
 
@@ -264,6 +328,13 @@ def run_abliteration(config: dict) -> bool:
                 filter_harmful_prompts=config["filter_prompts"],
                 device=config["device"],
                 dtype=dtype_map[config["dtype"]],
+                # Advanced options
+                use_winsorization=config.get("use_winsorization", False),
+                winsorize_percentile=config.get("winsorize_percentile", 0.995),
+                use_null_space=config.get("use_null_space", False),
+                preservation_prompts_path=config.get("preservation_prompts_path"),
+                null_space_rank_ratio=config.get("null_space_rank_ratio", 0.95),
+                use_adaptive_weighting=config.get("use_adaptive_weighting", False),
             )
 
             # Filter prompts if enabled
@@ -281,12 +352,39 @@ def run_abliteration(config: dict) -> bool:
             # Compute refusal directions
             progress.update(task, description="Computing refusal directions...")
             directions = compute_refusal_directions(model, tokenizer, abl_config)
-            progress.advance(task, 25)
+            progress.advance(task, 20)
+
+            # Compute null-space projectors if enabled
+            null_space_projector = None
+            if abl_config.use_null_space:
+                progress.update(task, description="Computing null-space projectors...")
+                from src.null_space import (
+                    NullSpaceConfig,
+                    compute_null_space_projectors,
+                    get_default_preservation_prompts_path,
+                )
+
+                preservation_path = abl_config.preservation_prompts_path
+                if preservation_path is None:
+                    preservation_path = get_default_preservation_prompts_path()
+
+                layers = list(directions.directions.keys()) or abl_config.extraction_layer_indices or []
+
+                null_config = NullSpaceConfig(
+                    preservation_prompts_path=preservation_path,
+                    svd_rank_ratio=abl_config.null_space_rank_ratio,
+                    regularization=abl_config.null_space_regularization,
+                )
+
+                null_space_projector = compute_null_space_projectors(
+                    model, tokenizer, null_config, layers, abl_config.device, abl_config.dtype
+                )
+            progress.advance(task, 10)
 
             # Apply abliteration
             progress.update(task, description="Applying abliteration to model weights...")
-            model = abliterate_model(model, directions, abl_config)
-            progress.advance(task, 20)
+            model = abliterate_model(model, directions, abl_config, null_space_projector)
+            progress.advance(task, 15)
 
             # Save model
             progress.update(task, description="Saving abliterated model...")
@@ -306,6 +404,10 @@ def run_abliteration(config: dict) -> bool:
                 if copied_files:
                     console.print(f"[{THEME['muted']}]Copied {len(copied_files)} vision files[/{THEME['muted']}]")
 
+            # Save null-space projectors if computed
+            if null_space_projector is not None:
+                null_space_projector.save(str(output_path / "null_space_projectors.pt"))
+
             # Save config
             config_save = {
                 "model_path": config["model_path"],
@@ -314,6 +416,12 @@ def run_abliteration(config: dict) -> bool:
                 "num_harmful_prompts": len(abl_config.harmful_prompts),
                 "num_harmless_prompts": len(abl_config.harmless_prompts),
                 "timestamp": datetime.now().isoformat(),
+                # Advanced options
+                "use_winsorization": config.get("use_winsorization", False),
+                "winsorize_percentile": config.get("winsorize_percentile"),
+                "use_null_space": config.get("use_null_space", False),
+                "null_space_rank_ratio": config.get("null_space_rank_ratio"),
+                "use_adaptive_weighting": config.get("use_adaptive_weighting", False),
             }
             with open(output_path / "abliteration_config.json", "w") as f:
                 json.dump(config_save, f, indent=2)
@@ -1188,12 +1296,28 @@ def main_menu():
 @click.option("--no_filter_prompts", is_flag=True, help="Don't filter prompts by refusal")
 @click.option("--device", type=str, default="cuda", help="Device to use (cuda/cpu)")
 @click.option("--dtype", type=click.Choice(["float16", "bfloat16", "float32"]), default="float16")
+# Advanced options
+@click.option("--winsorize/--no-winsorize", default=False, help="Enable Winsorization (clips outliers)")
+@click.option("--winsorize-percentile", type=float, default=0.995, help="Winsorize percentile (0.99-0.999)")
+@click.option("--null-space/--no-null-space", default=False, help="Enable null-space constraints")
+@click.option("--preservation-prompts", type=str, default=None, help="Path to preservation prompts file")
+@click.option("--null-space-rank-ratio", type=float, default=0.95, help="Null-space SVD rank ratio (0.9-0.99)")
+@click.option("--adaptive-weighting/--no-adaptive-weighting", default=False, help="Enable adaptive layer weighting")
 def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
-        no_norm_preservation, no_filter_prompts, device, dtype):
+        no_norm_preservation, no_filter_prompts, device, dtype,
+        winsorize, winsorize_percentile, null_space, preservation_prompts,
+        null_space_rank_ratio, adaptive_weighting):
     """
     Abliteration Toolkit - Remove refusal behavior from language models.
 
     Run without arguments for interactive mode, or use --batch for automation.
+
+    Advanced options enable research-backed enhancements:
+    \b
+      --winsorize              Clip outlier activations (recommended for Gemma models)
+      --null-space             Preserve model capabilities using null-space constraints
+      --preservation-prompts   Custom prompts for null-space computation
+      --adaptive-weighting     Per-layer adaptive ablation strength
     """
     if batch:
         if not model_path or not output_path:
@@ -1209,6 +1333,13 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
             "filter_prompts": not no_filter_prompts,
             "device": device,
             "dtype": dtype,
+            # Advanced options
+            "use_winsorization": winsorize,
+            "winsorize_percentile": winsorize_percentile,
+            "use_null_space": null_space,
+            "preservation_prompts_path": preservation_prompts,
+            "null_space_rank_ratio": null_space_rank_ratio,
+            "use_adaptive_weighting": adaptive_weighting,
         }
 
         display_banner()
