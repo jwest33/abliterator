@@ -49,19 +49,36 @@ def compare_results(file1: str, file2: str, show_all: bool = False) -> None:
     name1 = Path(file1).stem
     name2 = Path(file2).stem
 
-    print(f"\n{'='*70}")
-    print("EVALUATION COMPARISON")
-    print(f"{'='*70}")
-    print(f"File 1: {name1}")
-    print(f"File 2: {name2}")
-    print(f"{'='*70}\n")
-
     # Get all tasks from both files
     all_tasks = sorted(set(metrics1.keys()) | set(metrics2.keys()))
 
+    # Calculate column widths dynamically
+    task_width = max(len("Task"), max((len(t) for t in all_tasks), default=4))
+
+    # Get all metric names to calculate metric column width
+    all_metric_names = set()
+    for task in all_tasks:
+        task_metrics1 = metrics1.get(task, {})
+        task_metrics2 = metrics2.get(task, {})
+        all_metric_names.update(task_metrics1.keys())
+        all_metric_names.update(task_metrics2.keys())
+    if not show_all:
+        all_metric_names = {m for m in all_metric_names if not m.endswith("_stderr")}
+    metric_width = max(len("Metric"), max((len(m) for m in all_metric_names), default=6))
+
+    # Calculate total line width (minimum 70 for readability)
+    line_width = max(70, task_width + metric_width + 10 + 10 + 10 + 8 + 5)  # 5 for spaces between columns
+
+    print(f"\n{'='*line_width}")
+    print("EVALUATION COMPARISON")
+    print(f"{'='*line_width}")
+    print(f"File 1: {name1}")
+    print(f"File 2: {name2}")
+    print(f"{'='*line_width}\n")
+
     # Print header
-    print(f"{'Task':<15} {'Metric':<12} {'File 1':>10} {'File 2':>10} {'Delta':>10} {'%':>8}")
-    print("-" * 70)
+    print(f"{'Task':<{task_width}} {'Metric':<{metric_width}} {'File 1':>10} {'File 2':>10} {'Delta':>10} {'%':>8}")
+    print("-" * line_width)
 
     total_delta = 0.0
     num_metrics = 0
@@ -108,36 +125,36 @@ def compare_results(file1: str, file2: str, show_all: bool = False) -> None:
                     total_delta += delta
                     num_metrics += 1
 
-                print(f"{task:<15} {metric:<12} {val1_str:>10} {val2_str:>10} {delta_str:>10} {pct_str:>8}")
+                print(f"{task:<{task_width}} {metric:<{metric_width}} {val1_str:>10} {val2_str:>10} {delta_str:>10} {pct_str:>8}")
                 continue
 
             val2_str = f"{val2:.3f}" if val2 is not None else "N/A"
-            print(f"{task:<15} {metric:<12} {val1_str:>10} {val2_str:>10} {delta_str:>10} {pct_str:>8}")
+            print(f"{task:<{task_width}} {metric:<{metric_width}} {val1_str:>10} {val2_str:>10} {delta_str:>10} {pct_str:>8}")
 
-    print("-" * 70)
+    print("-" * line_width)
     if num_metrics > 0:
         avg_delta = total_delta / num_metrics
         print(f"\nAverage delta across {num_metrics} metrics: {avg_delta:+.4f} ({avg_delta*100:+.2f}%)")
 
     # Special interpretation for refusal evals
     if is_refusal_eval(data1) or is_refusal_eval(data2):
-        print("\n" + "-" * 70)
+        print("\n" + "-" * line_width)
         print("REFUSAL EVAL INTERPRETATION")
-        print("-" * 70)
+        print("-" * line_width)
         print("For ABLITERATED models (vs base):")
         print("  - harmful_prompts refusal_rate ↓ = abliteration working (less refusals)")
         print("  - harmless_prompts refusal_rate ~ = no over-refusal introduced")
 
     # Print metadata comparison
-    print(f"\n{'='*70}")
+    print(f"\n{'='*line_width}")
     print("METADATA")
-    print(f"{'='*70}")
+    print(f"{'='*line_width}")
 
     config1 = data1.get("config", {})
     config2 = data2.get("config", {})
 
     print(f"{'Property':<25} {'File 1':<30} {'File 2':<30}")
-    print("-" * 70)
+    print("-" * line_width)
 
     for key in ["model_num_parameters", "model_dtype", "batch_size", "limit"]:
         v1 = config1.get(key, "N/A")
