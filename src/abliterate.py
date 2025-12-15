@@ -10,9 +10,6 @@ This script removes refusal behavior from language models by:
 The norm-preserving aspect ensures that after removing the refusal component,
 the remaining weight matrix is rescaled to maintain its original Frobenius norm,
 preserving the model's overall activation magnitudes.
-
-Author: Jake (with Claude)
-License: MIT
 """
 
 import argparse

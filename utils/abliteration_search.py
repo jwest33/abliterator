@@ -7,9 +7,6 @@ Iteratively searches for optimal abliteration parameters by:
 2. Running abliteration with various parameter combinations
 3. Evaluating each abliterated model with lm-evaluation-harness
 4. Comparing accuracy deltas and refusal rates to find optimal settings
-
-Author: Jake (with Claude)
-License: MIT
 """
 
 import argparse

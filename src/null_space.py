@@ -25,9 +25,6 @@ Null-space constrained ablation:
   W_new = W + ΔW_constrained
 
 This ensures: W_new @ k_i ≈ W @ k_i for all preserved activations k_i
-
-Author: Jake (with Claude)
-License: MIT
 """
 
 import logging
