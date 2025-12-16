@@ -25,6 +25,12 @@ VL_ARCHITECTURES = {
     "paligemma": ["PaliGemmaForConditionalGeneration"],
 }
 
+# Architectures that need special text-only loading even though they're multimodal
+# These use ForConditionalGeneration but can be loaded with the text-only model class
+FORCE_TEXT_MODEL_ARCHITECTURES = {
+    "Gemma3ForConditionalGeneration": "Gemma3ForCausalLM",
+}
+
 
 def detect_model_type(model_path: str) -> dict:
     """
@@ -107,6 +113,15 @@ def load_model_and_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Check if we need to force a text-only model class
+    # Some multimodal architectures (like Gemma3) have a separate text-only class
+    force_text_class = None
+    for arch in model_info.get("architectures", []):
+        if arch in FORCE_TEXT_MODEL_ARCHITECTURES:
+            force_text_class = FORCE_TEXT_MODEL_ARCHITECTURES[arch]
+            logger.info(f"Detected {arch}, will use text-only class: {force_text_class}")
+            break
+
     # Load model with appropriate class
     if model_info["is_vl"]:
         logger.info(f"Loading VL model with AutoModelForImageTextToText...")
@@ -123,6 +138,36 @@ def load_model_and_tokenizer(
             raise ImportError(
                 "AutoModelForImageTextToText requires transformers >= 4.57.0. "
                 "Please upgrade with: pip install --upgrade transformers"
+            )
+    elif force_text_class:
+        # Load with specific text-only model class to avoid multimodal issues
+        logger.info(f"Loading model with specific class: {force_text_class}...")
+        try:
+            # Dynamically import the model class from transformers
+            import transformers
+            model_class = getattr(transformers, force_text_class, None)
+            if model_class is None:
+                logger.warning(f"Could not find {force_text_class}, falling back to AutoModelForCausalLM")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    dtype=dtype,
+                    device_map=device,
+                    trust_remote_code=trust_remote_code,
+                )
+            else:
+                model = model_class.from_pretrained(
+                    model_path,
+                    dtype=dtype,
+                    device_map=device,
+                    trust_remote_code=trust_remote_code,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load with {force_text_class}: {e}, falling back to AutoModelForCausalLM")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                dtype=dtype,
+                device_map=device,
+                trust_remote_code=trust_remote_code,
             )
     else:
         logger.info(f"Loading model with AutoModelForCausalLM...")

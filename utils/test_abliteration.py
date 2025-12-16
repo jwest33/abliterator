@@ -58,9 +58,14 @@ def generate_response(
     tokenizer: AutoTokenizer,
     prompt: str,
     max_new_tokens: int = 150,
-    temperature: float = 0.7,
+    temperature: float = 0.0,
+    do_sample: bool = False,
 ) -> str:
-    """Generate a response to a prompt."""
+    """Generate a response to a prompt.
+
+    Uses greedy decoding by default for stability. Set do_sample=True and
+    temperature > 0 to enable sampling.
+    """
     if hasattr(tokenizer, "apply_chat_template"):
         messages = [{"role": "user", "content": prompt}]
         formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -70,13 +75,22 @@ def generate_response(
     inputs = tokenizer(formatted, return_tensors="pt").to(model.device)
 
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id,
-        )
+        if do_sample and temperature > 0:
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=True,
+                pad_token_id=tokenizer.pad_token_id,
+                top_p=0.95,
+            )
+        else:
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
 
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
@@ -115,19 +129,29 @@ def generate_batch(
 
     # Tokenize with padding (left padding for generation)
     tokenizer.padding_side = "left"
+
+    # Determine max_length for truncation
+    # Use model's max length if reasonable, otherwise default to 2048
+    max_length = getattr(tokenizer, "model_max_length", None)
+    if max_length is None or max_length > 100000:  # Some tokenizers have very large defaults
+        max_length = 2048
+
     inputs = tokenizer(
         formatted,
         return_tensors="pt",
         padding=True,
         truncation=True,
+        max_length=max_length,
     ).to(model.device)
 
     with torch.no_grad():
+        # Use greedy decoding for batch generation - more stable for evaluation
+        # Sampling can cause CUDA errors with some abliterated models due to
+        # numerical instability in logits
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
+            do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
         )
 
@@ -166,6 +190,21 @@ def find_max_batch_size(
         return 1
 
     logger.info("Auto-detecting optimal batch size...")
+
+    # First, verify batch size 1 works at all
+    clear_gpu_memory()
+    try:
+        test_prompt = sample_prompts[:1]
+        _ = generate_batch(model, tokenizer, test_prompt, max_new_tokens, temperature)
+        logger.info("  Batch size 1: OK")
+    except Exception as e:
+        # If batch size 1 fails, we have a fundamental generation issue
+        error_msg = str(e).lower()
+        if "assertion" in error_msg or "cuda" in error_msg:
+            logger.error(f"  CUDA error during generation: {e}")
+            logger.error("  This may indicate a model compatibility issue. Trying with batch size 1...")
+            # Re-raise to let caller handle it, or return 1 and hope non-batch generation works
+        raise
 
     # Start with batch size 1, then try to increase
     working_batch_size = 1
