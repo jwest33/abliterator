@@ -1,8 +1,8 @@
 # Abliterator
 
-![abliterator cli](cli_example.jpg)
+### Orthogonal Projection Abliteration toolkit featuring Norm-Preservation, Null-Space Constaints, Winsorization, and Adaptive Layer Weighting
 
-A toolkit that implements current SOTA abliteration techniques for removing refusal behavior from language models. It computes "refusal directions" from contrastive prompt pairs and projects them out of model weights while preserving norms.
+![abliterator cli](cli_example.jpg)
 
 ## Installation
 
@@ -34,7 +34,7 @@ The main workflow. Select a model from discovered directories (or enter a path m
 The CLI scans your configured directories and shows available models. Already-abliterated models are marked with `[A]`.
 
 **Step 2: Output Path**
-Defaults to `./abliterated_models/{model-name}-abliterated`. Change it if you like.
+Defaults to `./abliterate/abliterated_models/{model-name}-abliterated`. Change it if you like.
 
 **Step 3: Configuration**
 - **Number of prompts**: How many harmful/harmless pairs to use (default: 30)

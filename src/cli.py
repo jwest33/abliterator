@@ -95,7 +95,7 @@ def select_model(title: str = "Select a model", allow_manual: bool = True) -> Op
 
     choices.append(questionary.Choice(
         title="[B] Back",
-        value=None,
+        value="__back__",
     ))
 
     selected = questionary.select(
@@ -103,6 +103,9 @@ def select_model(title: str = "Select a model", allow_manual: bool = True) -> Op
         choices=choices,
         style=custom_style,
     ).ask()
+
+    if selected == "__back__" or selected is None:
+        return None
 
     if selected == "__manual__":
         path = questionary.path(
@@ -127,7 +130,7 @@ def get_abliteration_config() -> Optional[dict]:
 
     # Output path
     console.print(f"\n[bold {THEME['primary']}]Step 2: Output Path[/bold {THEME['primary']}]\n")
-    default_output = f"./abliterated_models/{Path(model_path).name}-abliterated"
+    default_output = f"./abliterate/abliterated_models/{Path(model_path).name}-abliterated"
 
     use_default = questionary.confirm(
         f"Use default output path? ({default_output})",
@@ -750,7 +753,7 @@ def run_gguf_export():
         return
 
     # Select output directory
-    default_output = config.get("default_output_dir", "./abliterated_models")
+    default_output = config.get("default_output_dir", "./abliterate/abliterated_models")
     output_dir = questionary.path(
         "Output directory:",
         default=default_output,

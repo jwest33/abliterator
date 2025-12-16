@@ -174,6 +174,37 @@ def clear_gpu_memory():
         gc.collect()
 
 
+def _quick_memory_test(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompts: list[str],
+) -> bool:
+    """
+    Quick memory test - only does forward pass without full generation.
+    Much faster than full generation for batch size probing.
+    """
+    formatted = format_prompts(tokenizer, prompts)
+    tokenizer.padding_side = "left"
+
+    max_length = getattr(tokenizer, "model_max_length", None)
+    if max_length is None or max_length > 100000:
+        max_length = 2048
+
+    inputs = tokenizer(
+        formatted,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    ).to(model.device)
+
+    with torch.no_grad():
+        # Just do a forward pass - this tests memory allocation without slow generation
+        _ = model(**inputs)
+
+    return True
+
+
 def find_max_batch_size(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -184,78 +215,73 @@ def find_max_batch_size(
 ) -> int:
     """
     Find maximum batch size that fits in GPU memory.
-    Uses binary search with OOM detection like lm-eval harness.
+    Uses fast forward-pass probing with exponential search.
     """
     if not torch.cuda.is_available():
         return 1
 
     logger.info("Auto-detecting optimal batch size...")
 
-    # First, verify batch size 1 works at all
-    clear_gpu_memory()
-    try:
-        test_prompt = sample_prompts[:1]
-        _ = generate_batch(model, tokenizer, test_prompt, max_new_tokens, temperature)
-        logger.info("  Batch size 1: OK")
-    except Exception as e:
-        # If batch size 1 fails, we have a fundamental generation issue
-        error_msg = str(e).lower()
-        if "assertion" in error_msg or "cuda" in error_msg:
-            logger.error(f"  CUDA error during generation: {e}")
-            logger.error("  This may indicate a model compatibility issue. Trying with batch size 1...")
-            # Re-raise to let caller handle it, or return 1 and hope non-batch generation works
-        raise
-
-    # Start with batch size 1, then try to increase
-    working_batch_size = 1
-    test_batch_size = 2
-
-    # Use a few sample prompts for testing
+    # Limit test prompts
     test_prompts = sample_prompts[:min(max_batch_size, len(sample_prompts))]
+    if len(test_prompts) < 2:
+        logger.info("  Not enough prompts for batch testing, using batch size 1")
+        return 1
 
-    while test_batch_size <= min(max_batch_size, len(test_prompts)):
-        clear_gpu_memory()
+    # Clear memory once at the start
+    clear_gpu_memory()
 
+    # Try batch sizes in larger jumps: 1, 4, 8, 16, 32, 64
+    # This is much faster than 1, 2, 4, 8, 16, 32, 64 with binary search
+    test_sizes = [1, 4, 8, 16, 32, 64]
+    test_sizes = [s for s in test_sizes if s <= max_batch_size and s <= len(test_prompts)]
+
+    working_batch_size = 0
+
+    for batch_size in test_sizes:
         try:
-            batch = test_prompts[:test_batch_size]
-            _ = generate_batch(model, tokenizer, batch, max_new_tokens, temperature)
-            working_batch_size = test_batch_size
-            logger.info(f"  Batch size {test_batch_size}: OK")
-            test_batch_size *= 2
-        except torch.cuda.OutOfMemoryError:
-            logger.info(f"  Batch size {test_batch_size}: OOM")
-            clear_gpu_memory()
-            break
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                logger.info(f"  Batch size {test_batch_size}: OOM")
-                clear_gpu_memory()
-                break
-            raise
-
-    # Binary search between working and failed batch size
-    low = working_batch_size
-    high = test_batch_size
-
-    while low < high - 1:
-        mid = (low + high) // 2
-        clear_gpu_memory()
-
-        try:
-            batch = test_prompts[:mid]
-            _ = generate_batch(model, tokenizer, batch, max_new_tokens, temperature)
-            low = mid
-            logger.info(f"  Batch size {mid}: OK")
+            batch = test_prompts[:batch_size]
+            _quick_memory_test(model, tokenizer, batch)
+            working_batch_size = batch_size
+            logger.info(f"  Batch size {batch_size}: OK")
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if isinstance(e, RuntimeError) and "out of memory" not in str(e).lower():
                 raise
-            high = mid
-            logger.info(f"  Batch size {mid}: OOM")
-            clear_gpu_memory()
+            logger.info(f"  Batch size {batch_size}: OOM")
+            torch.cuda.empty_cache()  # Quick clear, no gc.collect()
+            break
 
-    clear_gpu_memory()
-    logger.info(f"Selected batch size: {low}")
-    return low
+    if working_batch_size == 0:
+        # Even batch size 1 failed with quick test, try actual generation
+        logger.info("  Quick test failed, trying full generation with batch size 1...")
+        clear_gpu_memory()
+        try:
+            _ = generate_batch(model, tokenizer, test_prompts[:1], max_new_tokens, temperature)
+            working_batch_size = 1
+            logger.info("  Batch size 1 (full): OK")
+        except Exception as e:
+            logger.error(f"  Generation failed even at batch size 1: {e}")
+            raise
+
+    # Apply safety margin (use 75% of max to avoid edge-case OOMs during actual generation)
+    safe_batch_size = max(1, int(working_batch_size * 0.75))
+
+    # Verify the safe batch size works with actual generation
+    if safe_batch_size > 1:
+        torch.cuda.empty_cache()
+        try:
+            _ = generate_batch(model, tokenizer, test_prompts[:safe_batch_size], max_new_tokens, temperature)
+            logger.info(f"  Verified batch size {safe_batch_size} with full generation")
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if isinstance(e, RuntimeError) and "out of memory" not in str(e).lower():
+                raise
+            # Fall back to smaller size
+            safe_batch_size = max(1, safe_batch_size // 2)
+            logger.info(f"  Reduced to batch size {safe_batch_size} after OOM during verification")
+            torch.cuda.empty_cache()
+
+    logger.info(f"Selected batch size: {safe_batch_size}")
+    return safe_batch_size
 
 
 def detect_refusal(response: str) -> bool:

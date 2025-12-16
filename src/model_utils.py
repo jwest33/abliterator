@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Model loading utilities with Vision-Language (VL) model support.
 

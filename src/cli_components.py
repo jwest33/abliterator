@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Rich CLI Components for Abliteration Toolkit
 
@@ -252,11 +253,11 @@ def get_gradient_text(text: str, colors: list[str] = None) -> Text:
 def display_banner():
     """Display the ASCII art banner with gradient colors."""
     banner_text = get_gradient_text(BANNER)
-    console.print(banner_text)
+    console.print(Align.center(banner_text))
 
     # Subtitle
     subtitle = Text()
-    subtitle.append("Norm-Preserving Orthogonal Projection Abliteration", style=f"bold {THEME['muted']}")
+    subtitle.append("Orthogonal Projection Abliteration with Norm-Preservation, Null-Space Constaints, Winsorization, and Adaptive Layer Weighting", style=f"bold {THEME['muted']}")
     console.print(Align.center(subtitle))
     console.print()
 
@@ -308,7 +309,7 @@ def display_system_info():
         padding=(0, 1),
         expand=False,
     )
-    console.print(panel)
+    console.print(Align.center(panel))
     console.print()
 
 
@@ -333,7 +334,7 @@ def display_menu(title: str, options: list[tuple[str, str]], show_quit: bool = T
         padding=(1, 2),
         expand=False,
     )
-    console.print(panel)
+    console.print(Align.center(panel))
 
 
 def find_models(search_paths: list[Path] = None) -> list[dict]:

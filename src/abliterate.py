@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-Norm-Preserving Orthogonal Projection Abliteration for HuggingFace Models (Safetensors)
-
-This script removes refusal behavior from language models by:
-1. Computing refusal directions from contrastive prompt pairs (harmful vs harmless)
-2. Applying norm-preserving orthogonal projection to ablate refusal directions from all linear layers
-3. Saving the modified model as a new safetensors model
-
-The norm-preserving aspect ensures that after removing the refusal component,
-the remaining weight matrix is rescaled to maintain its original Frobenius norm,
-preserving the model's overall activation magnitudes.
-"""
-
 import argparse
 import json
 import logging
@@ -1046,7 +1033,7 @@ def filter_harmful_prompts_by_refusal(
 def run_abliteration(config: AbliterationConfig):
     """Run the complete abliteration pipeline."""
     logger.info("=" * 60)
-    logger.info("Norm-Preserving Orthogonal Projection Abliteration")
+    logger.info("Orthogonal Projection Abliteration with Norm-Preservation, Null-Space Constaints, Winsorization, and Adaptive Layer Weighting")
     logger.info("=" * 60)
 
     # Load model and tokenizer first (needed for refusal filtering)
