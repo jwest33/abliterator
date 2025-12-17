@@ -580,6 +580,10 @@ def create_default_preservation_prompts() -> list[str]:
 
 
 def get_default_preservation_prompts_path() -> str:
-    """Get the path to the default preservation prompts file."""
-    from src.abliterate import get_package_root
-    return str(get_package_root() / "prompts" / "preservation.txt")
+    """Get the path to the default preservation prompts file.
+
+    Checks user prompts directory (~/.abliterate/prompts/) first,
+    then falls back to the package prompts directory.
+    """
+    from src.cli_components import get_prompts_path
+    return str(get_prompts_path("preservation.txt"))

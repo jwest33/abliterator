@@ -16,7 +16,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.model_utils import load_model_and_tokenizer
-from src.cli_components import get_versioned_path
+from src.cli_components import get_versioned_path, get_prompts_path
 
 # Configure logging
 logging.basicConfig(
@@ -39,13 +39,16 @@ def get_package_root() -> Path:
 def get_default_prompts_path(filename: str) -> str:
     """Get the absolute path to a prompts file.
 
+    Checks user prompts directory (~/.abliterate/prompts/) first,
+    then falls back to the package prompts directory.
+
     Args:
         filename: Name of the prompts file (e.g., 'harmful.txt')
 
     Returns:
         Absolute path to the prompts file as a string
     """
-    return str(get_package_root() / "prompts" / filename)
+    return str(get_prompts_path(filename))
 
 
 def copy_vision_files(source_path: Path, dest_path: Path) -> list[str]:

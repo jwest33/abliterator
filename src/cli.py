@@ -35,6 +35,7 @@ from src.cli_components import (
     add_model_path,
     clear_screen,
     console,
+    copy_prompts_to_user_dir,
     create_progress_bar,
     display_banner,
     display_comparison_panel,
@@ -48,14 +49,21 @@ from src.cli_components import (
     display_warning,
     find_models,
     get_config_path,
+    get_default_direction_multiplier,
+    get_default_dtype,
+    get_default_num_prompts,
+    get_default_output_dir,
     get_eval_results_dir,
     get_model_paths,
+    get_user_prompts_dir,
     get_versioned_path,
     load_config,
     print_divider,
     remove_model_path,
     save_config,
+    set_default_output_dir,
     set_eval_results_dir,
+    user_prompts_exist,
 )
 
 # Questionary custom style (orange theme)
@@ -130,7 +138,8 @@ def get_abliteration_config() -> Optional[dict]:
 
     # Output path
     console.print(f"\n[bold {THEME['primary']}]Step 2: Output Path[/bold {THEME['primary']}]\n")
-    default_output = f"./abliterate/abliterated_models/{Path(model_path).name}-abliterated"
+    output_dir = get_default_output_dir()
+    default_output = f"{output_dir}/{Path(model_path).name}-abliterated"
 
     use_default = questionary.confirm(
         f"Use default output path? ({default_output})",
@@ -152,13 +161,13 @@ def get_abliteration_config() -> Optional[dict]:
 
     config["num_prompts"] = int(questionary.text(
         "Number of prompts to use:",
-        default="30",
+        default=str(get_default_num_prompts()),
         style=custom_style,
     ).ask())
 
     config["direction_multiplier"] = float(questionary.text(
         "Direction multiplier (ablation strength):",
-        default="1.0",
+        default=str(get_default_direction_multiplier()),
         style=custom_style,
     ).ask())
 
@@ -194,7 +203,7 @@ def get_abliteration_config() -> Optional[dict]:
             questionary.Choice("bfloat16 (better precision)", value="bfloat16"),
             questionary.Choice("float32 (full precision)", value="float32"),
         ],
-        default="float16",
+        default=get_default_dtype(),
         style=custom_style,
     ).ask()
 
@@ -870,8 +879,10 @@ def run_settings():
         action = questionary.select(
             "What would you like to do?",
             choices=[
-                questionary.Choice("Manage model directories", value="model_paths"),
+                questionary.Choice("Manage model search directories", value="model_paths"),
+                questionary.Choice("Change model output directory", value="output_dir"),
                 questionary.Choice("Change eval results directory", value="eval_dir"),
+                questionary.Choice("Manage prompts", value="prompts"),
                 questionary.Choice("Configure llama.cpp path (GGUF export)", value="llama_cpp"),
                 questionary.Choice("View all settings", value="view"),
                 questionary.Choice("Reset to defaults", value="reset"),
@@ -887,8 +898,14 @@ def run_settings():
         elif action == "model_paths":
             _manage_model_paths()
 
+        elif action == "output_dir":
+            _manage_output_dir()
+
         elif action == "eval_dir":
             _manage_eval_results_dir()
+
+        elif action == "prompts":
+            _manage_prompts()
 
         elif action == "llama_cpp":
             _manage_llama_cpp_path()
@@ -984,6 +1001,49 @@ def _manage_model_paths():
                     display_error("Failed to remove path.")
 
 
+def _manage_output_dir():
+    """Manage default output directory for abliterated models."""
+    current_dir = get_default_output_dir()
+
+    console.print(f"\n[bold {THEME['primary']}]Model Output Directory[/bold {THEME['primary']}]\n")
+    console.print(f"Current directory: [{THEME['primary']}]{current_dir}[/{THEME['primary']}]")
+    console.print(f"[{THEME['muted']}]Abliterated models will be saved here by default.[/{THEME['muted']}]")
+
+    exists = Path(current_dir).exists()
+    status = f"[green]exists[/green]" if exists else f"[yellow]will be created[/yellow]"
+    console.print(f"Status: {status}\n")
+
+    change = questionary.confirm(
+        "Change the model output directory?",
+        default=False,
+        style=custom_style,
+    ).ask()
+
+    if change:
+        new_path = questionary.path(
+            "Enter new model output directory:",
+            default=current_dir,
+            style=custom_style,
+        ).ask()
+
+        if new_path:
+            set_default_output_dir(new_path)
+            display_success(f"Model output directory set to: {new_path}")
+
+            # Ask if they want to add this to model search paths
+            add_to_search = questionary.confirm(
+                "Add this directory to model search paths?",
+                default=True,
+                style=custom_style,
+            ).ask()
+
+            if add_to_search:
+                if add_model_path(new_path):
+                    display_success(f"Added to model search paths: {new_path}")
+                else:
+                    console.print(f"[{THEME['muted']}]Already in model search paths.[/{THEME['muted']}]")
+
+
 def _manage_eval_results_dir():
     """Manage evaluation results directory."""
     current_dir = get_eval_results_dir()
@@ -1011,6 +1071,89 @@ def _manage_eval_results_dir():
         if new_path:
             set_eval_results_dir(new_path)
             display_success(f"Eval results directory set to: {new_path}")
+
+
+def _manage_prompts():
+    """Manage prompts directory and files."""
+    prompts_dir = get_user_prompts_dir()
+
+    console.print(f"\n[bold {THEME['primary']}]Prompts Management[/bold {THEME['primary']}]\n")
+    console.print(f"Prompts directory: [{THEME['primary']}]{prompts_dir}[/{THEME['primary']}]")
+
+    # Check status
+    if user_prompts_exist():
+        console.print(f"Status: [green]configured[/green]\n")
+
+        # List prompt files
+        from rich.table import Table
+        table = Table(show_header=True, header_style=f"bold {THEME['primary']}")
+        table.add_column("File", style=THEME["primary"])
+        table.add_column("Lines", justify="right")
+        table.add_column("Description", style=THEME["muted"])
+
+        descriptions = {
+            "harmful.txt": "Prompts that should be refused (before abliteration)",
+            "harmless.txt": "Prompts that should be answered normally",
+            "preservation.txt": "Prompts for null-space capability preservation",
+        }
+
+        for prompt_file in sorted(prompts_dir.glob("*.txt")):
+            try:
+                line_count = sum(1 for line in open(prompt_file, encoding="utf-8") if line.strip())
+            except Exception:
+                line_count = "?"
+            desc = descriptions.get(prompt_file.name, "Custom prompts file")
+            table.add_row(prompt_file.name, str(line_count), desc)
+
+        console.print(table)
+    else:
+        console.print(f"Status: [yellow]not configured[/yellow]\n")
+
+    console.print()
+
+    action = questionary.select(
+        "What would you like to do?",
+        choices=[
+            questionary.Choice("Reset prompts to defaults", value="reset"),
+            questionary.Choice("Open prompts directory", value="open"),
+            questionary.Choice("Back", value="back"),
+        ],
+        style=custom_style,
+    ).ask()
+
+    if action == "back" or action is None:
+        return
+
+    elif action == "reset":
+        confirm = questionary.confirm(
+            "Reset all prompts to package defaults? (This will overwrite your changes)",
+            default=False,
+            style=custom_style,
+        ).ask()
+
+        if confirm:
+            if copy_prompts_to_user_dir(force=True):
+                display_success(f"Prompts reset to defaults in: {prompts_dir}")
+            else:
+                display_error("Could not reset prompts (package prompts not found)")
+
+    elif action == "open":
+        # Try to open the directory in file explorer
+        import subprocess
+        import platform
+
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(["explorer", str(prompts_dir)], check=False)
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.run(["open", str(prompts_dir)], check=False)
+            else:  # Linux
+                subprocess.run(["xdg-open", str(prompts_dir)], check=False)
+            display_success(f"Opened: {prompts_dir}")
+        except Exception as e:
+            display_warning(f"Could not open directory: {e}\n\nPath: {prompts_dir}")
 
 
 def _manage_llama_cpp_path():
@@ -1211,6 +1354,21 @@ def run_first_time_setup():
     # Save config
     save_config(config)
 
+    # Copy prompts to user directory
+    console.print(f"\n[bold {THEME['primary']}]Step 5: Setting Up Prompts[/bold {THEME['primary']}]\n")
+    console.print(f"[{THEME['muted']}]Copying default prompts to your config directory...[/{THEME['muted']}]")
+    console.print(f"[{THEME['muted']}]You can edit these prompts to customize abliteration behavior.[/{THEME['muted']}]\n")
+
+    if copy_prompts_to_user_dir():
+        prompts_dir = get_user_prompts_dir()
+        display_success(f"Prompts copied to: {prompts_dir}")
+        console.print(f"\n[{THEME['muted']}]Files:[/{THEME['muted']}]")
+        console.print(f"  [{THEME['primary']}]harmful.txt[/{THEME['primary']}]     - Prompts that should be refused (before abliteration)")
+        console.print(f"  [{THEME['primary']}]harmless.txt[/{THEME['primary']}]   - Prompts that should be answered normally")
+        console.print(f"  [{THEME['primary']}]preservation.txt[/{THEME['primary']}] - Prompts for null-space capability preservation")
+    else:
+        display_warning("Could not copy prompts (package prompts not found)")
+
     console.print()
     display_success(f"Configuration saved to: {get_config_path()}")
     console.print(f"\n[{THEME['muted']}]You can modify these settings anytime from the Settings menu.[/{THEME['muted']}]\n")
@@ -1291,13 +1449,13 @@ def main_menu():
 @click.command()
 @click.option("--batch", is_flag=True, help="Run in batch mode (non-interactive)")
 @click.option("--model_path", "-m", type=str, help="Path to input model")
-@click.option("--output_path", "-o", type=str, help="Path for output model")
-@click.option("--num_prompts", type=int, default=30, help="Number of prompts to use")
-@click.option("--direction_multiplier", type=float, default=1.0, help="Ablation strength")
+@click.option("--output_path", "-o", type=str, help="Path for output model (uses config default_output_dir if not specified)")
+@click.option("--num_prompts", type=int, default=None, help="Number of prompts to use (default: from config)")
+@click.option("--direction_multiplier", type=float, default=None, help="Ablation strength (default: from config)")
 @click.option("--no_norm_preservation", is_flag=True, help="Disable norm preservation")
 @click.option("--no_filter_prompts", is_flag=True, help="Don't filter prompts by refusal")
 @click.option("--device", type=str, default="cuda", help="Device to use (cuda/cpu)")
-@click.option("--dtype", type=click.Choice(["float16", "bfloat16", "float32"]), default="float16")
+@click.option("--dtype", type=click.Choice(["float16", "bfloat16", "float32"]), default=None, help="Precision (default: from config)")
 # Advanced options
 @click.option("--winsorize/--no-winsorize", default=False, help="Enable Winsorization (clips outliers)")
 @click.option("--winsorize-percentile", type=float, default=0.995, help="Winsorize percentile (0.99-0.999)")
@@ -1322,19 +1480,32 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
       --adaptive-weighting     Per-layer adaptive ablation strength
     """
     if batch:
-        if not model_path or not output_path:
-            console.print("[red]Error: --model_path and --output_path are required in batch mode[/red]")
+        if not model_path:
+            console.print("[red]Error: --model_path is required in batch mode[/red]")
             sys.exit(1)
+
+        # Use config defaults for any unspecified values
+        effective_num_prompts = num_prompts if num_prompts is not None else get_default_num_prompts()
+        effective_multiplier = direction_multiplier if direction_multiplier is not None else get_default_direction_multiplier()
+        effective_dtype = dtype if dtype is not None else get_default_dtype()
+
+        # Construct output path from config if not specified
+        if output_path:
+            effective_output_path = output_path
+        else:
+            output_dir = get_default_output_dir()
+            model_name = Path(model_path).name
+            effective_output_path = f"{output_dir}/{model_name}-abliterated"
 
         config = {
             "model_path": model_path,
-            "output_path": output_path,
-            "num_prompts": num_prompts,
-            "direction_multiplier": direction_multiplier,
+            "output_path": effective_output_path,
+            "num_prompts": effective_num_prompts,
+            "direction_multiplier": effective_multiplier,
             "norm_preservation": not no_norm_preservation,
             "filter_prompts": not no_filter_prompts,
             "device": device,
-            "dtype": dtype,
+            "dtype": effective_dtype,
             # Advanced options
             "use_winsorization": winsorize,
             "winsorize_percentile": winsorize_percentile,

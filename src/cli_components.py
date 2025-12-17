@@ -20,13 +20,11 @@ import psutil
 import torch
 
 
-# =============================================================================
 # Configuration Management
-# =============================================================================
 
 def get_config_dir() -> Path:
     """Get the configuration directory path."""
-    config_dir = Path.home() / ".abliterate"
+    config_dir = Path.home() / "abliterate"
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
 
@@ -36,18 +34,93 @@ def get_config_path() -> Path:
     return get_config_dir() / "config.json"
 
 
+def get_user_prompts_dir() -> Path:
+    """Get the user prompts directory path (~/.abliterate/prompts/)."""
+    prompts_dir = get_config_dir() / "prompts"
+    return prompts_dir
+
+
+def get_package_prompts_dir() -> Path:
+    """Get the package prompts directory path (bundled with the app)."""
+    # Navigate from this file to the prompts directory
+    return Path(__file__).parent.parent / "prompts"
+
+
+def copy_prompts_to_user_dir(force: bool = False) -> bool:
+    """
+    Copy the default prompts from the package to the user's config directory.
+
+    Args:
+        force: If True, overwrite existing files. If False, skip existing files.
+
+    Returns:
+        True if any files were copied, False otherwise.
+    """
+    import shutil
+
+    package_prompts = get_package_prompts_dir()
+    user_prompts = get_user_prompts_dir()
+
+    if not package_prompts.exists():
+        return False
+
+    # Create user prompts directory
+    user_prompts.mkdir(parents=True, exist_ok=True)
+
+    copied = False
+    for prompt_file in package_prompts.glob("*.txt"):
+        dest_file = user_prompts / prompt_file.name
+        if force or not dest_file.exists():
+            shutil.copy2(prompt_file, dest_file)
+            copied = True
+
+    return copied
+
+
+def user_prompts_exist() -> bool:
+    """Check if user prompts directory exists and has prompt files."""
+    user_prompts = get_user_prompts_dir()
+    if not user_prompts.exists():
+        return False
+    return any(user_prompts.glob("*.txt"))
+
+
+def get_prompts_path(filename: str) -> Path:
+    """
+    Get the path to a prompts file, preferring user prompts over package prompts.
+
+    Args:
+        filename: Name of the prompts file (e.g., 'harmful.txt')
+
+    Returns:
+        Path to the prompts file (user's copy if exists, otherwise package default)
+    """
+    # Check user prompts directory first
+    user_path = get_user_prompts_dir() / filename
+    if user_path.exists():
+        return user_path
+
+    # Fall back to package prompts
+    package_path = get_package_prompts_dir() / filename
+    return package_path
+
+
 def get_default_config() -> dict:
     """Return default configuration settings."""
+    config_dir = get_config_dir()
+    models_dir = str(config_dir / "models")
+    eval_dir = str(config_dir / "eval_results")
+
     return {
         "model_paths": [
             "D:/models",
             "C:/models",
             str(Path.home() / ".cache" / "huggingface" / "hub"),
             "./",
-            "./abliterate/abliterated_models",
+            models_dir,  # Include the default output dir in search paths
         ],
-        "default_output_dir": "./abliterate/abliterated_models",
-        "eval_results_dir": "./abliterate/eval_results",
+        "default_output_dir": models_dir,
+        "eval_results_dir": eval_dir,
         "default_num_prompts": 30,
         "default_direction_multiplier": 1.0,
         "default_dtype": "float16",
@@ -125,6 +198,37 @@ def set_eval_results_dir(path: str) -> None:
     save_config(config)
 
 
+def get_default_output_dir() -> str:
+    """Get the configured default output directory for abliterated models."""
+    config = load_config()
+    return config.get("default_output_dir", get_default_config()["default_output_dir"])
+
+
+def set_default_output_dir(path: str) -> None:
+    """Set the default output directory for abliterated models."""
+    config = load_config()
+    config["default_output_dir"] = str(Path(path).resolve())
+    save_config(config)
+
+
+def get_default_num_prompts() -> int:
+    """Get the configured default number of prompts for abliteration."""
+    config = load_config()
+    return config.get("default_num_prompts", get_default_config()["default_num_prompts"])
+
+
+def get_default_direction_multiplier() -> float:
+    """Get the configured default direction multiplier (ablation strength)."""
+    config = load_config()
+    return config.get("default_direction_multiplier", get_default_config()["default_direction_multiplier"])
+
+
+def get_default_dtype() -> str:
+    """Get the configured default dtype for abliteration."""
+    config = load_config()
+    return config.get("default_dtype", get_default_config()["default_dtype"])
+
+
 def get_versioned_path(path: Path | str) -> Path:
     """
     Get a versioned path if the original path already exists.
@@ -175,9 +279,7 @@ def get_versioned_path(path: Path | str) -> Path:
             raise ValueError(f"Too many versions of {base_name} exist (>1000)")
 
 
-# =============================================================================
 # Rich UI Components
-# =============================================================================
 
 from rich.align import Align
 from rich.console import Console, Group

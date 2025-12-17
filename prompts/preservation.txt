@@ -2,9 +2,7 @@
 # These prompts capture activations for capabilities to preserve during abliteration
 # One prompt per line, lines starting with # are ignored
 
-# =============================================================================
 # STEM - PHYSICS
-# =============================================================================
 Explain Newton's three laws of motion with examples.
 What is the difference between kinetic and potential energy?
 How does electromagnetic induction work?
@@ -14,9 +12,7 @@ Describe wave-particle duality in quantum mechanics.
 How do black holes form and what are their properties?
 Explain the relationship between voltage, current, and resistance.
 
-# =============================================================================
 # STEM - CHEMISTRY
-# =============================================================================
 Explain the difference between ionic and covalent bonds.
 What is electronegativity and how does it affect bonding?
 Describe the process of titration in analytical chemistry.
@@ -26,9 +22,7 @@ How do catalysts speed up chemical reactions?
 What is the difference between organic and inorganic chemistry?
 Describe the structure and properties of benzene.
 
-# =============================================================================
 # STEM - BIOLOGY & MEDICINE
-# =============================================================================
 Explain how photosynthesis works.
 Describe the water cycle.
 How does the immune system fight infections?
@@ -40,9 +34,7 @@ What are viruses and how do they differ from bacteria?
 Explain antibiotic resistance and why it's a concern.
 What is CRISPR and how does it edit genes?
 
-# =============================================================================
 # STEM - MATHEMATICS
-# =============================================================================
 Solve the equation 2x + 5 = 15.
 What is the Pythagorean theorem?
 Explain probability using a coin flip example.
@@ -54,9 +46,7 @@ How do you solve a system of linear equations?
 Explain the concept of mathematical proof by induction.
 What is the difference between permutations and combinations?
 
-# =============================================================================
 # STEM - COMPUTER SCIENCE
-# =============================================================================
 Write a Python function to calculate factorial.
 Explain the difference between a list and a dictionary in Python.
 How does a binary search algorithm work?
@@ -68,9 +58,7 @@ How does a hash table work?
 What is recursion and when should you use it?
 Explain the difference between SQL and NoSQL databases.
 
-# =============================================================================
 # SOCIAL SCIENCES - ECONOMICS
-# =============================================================================
 Explain the law of supply and demand.
 What is the difference between fiscal and monetary policy?
 How does inflation affect purchasing power?
@@ -82,9 +70,7 @@ Explain the concept of market equilibrium.
 What is comparative advantage in international trade?
 How do central banks control interest rates?
 
-# =============================================================================
 # SOCIAL SCIENCES - PSYCHOLOGY
-# =============================================================================
 Explain classical conditioning with Pavlov's experiment.
 What is cognitive dissonance?
 Describe the stages of human development according to Erikson.
@@ -96,9 +82,7 @@ What is confirmation bias?
 Explain the difference between nature and nurture in development.
 What is emotional intelligence?
 
-# =============================================================================
 # SOCIAL SCIENCES - SOCIOLOGY & POLITICAL SCIENCE
-# =============================================================================
 Compare and contrast democracy and authoritarianism.
 What is social stratification?
 Explain the concept of cultural relativism.
@@ -110,9 +94,7 @@ What is the separation of powers in government?
 Describe different types of electoral systems.
 What is globalization and its effects on society?
 
-# =============================================================================
 # LAW & ETHICS
-# =============================================================================
 What is the difference between civil and criminal law?
 Explain the concept of jurisdiction in legal systems.
 What are human rights according to international law?
@@ -124,9 +106,7 @@ Describe utilitarianism as an ethical framework.
 What is corporate social responsibility?
 Explain the concept of due process.
 
-# =============================================================================
 # HISTORY & GEOGRAPHY
-# =============================================================================
 Analyze the causes of World War I.
 What were the main causes of the French Revolution?
 Describe the Renaissance and its impact on Europe.
@@ -140,9 +120,7 @@ Explain the significance of the Silk Road in history.
 What were the causes and effects of the Protestant Reformation?
 Describe the main events of the Russian Revolution.
 
-# =============================================================================
 # HUMANITIES - PHILOSOPHY & RELIGION
-# =============================================================================
 Who wrote Romeo and Juliet?
 Explain Plato's Allegory of the Cave.
 What is existentialism?
@@ -154,9 +132,7 @@ Describe the Socratic method of inquiry.
 What is the problem of evil in philosophy of religion?
 Explain the concept of karma in Hinduism.
 
-# =============================================================================
 # HUMANITIES - LANGUAGE & LITERATURE
-# =============================================================================
 What are the major themes in Shakespeare's Hamlet?
 Explain the difference between simile and metaphor.
 What is the hero's journey narrative structure?
@@ -168,9 +144,7 @@ Describe the structure of a sonnet.
 What is stream of consciousness in writing?
 Explain the difference between deductive and inductive reasoning.
 
-# =============================================================================
 # HEALTH & NUTRITION
-# =============================================================================
 What are some tips for better sleep?
 Suggest some healthy breakfast options.
 How can I improve my study habits?
@@ -182,9 +156,7 @@ Explain the role of fiber in digestion.
 What are the effects of chronic stress on the body?
 How can I maintain a healthy work-life balance?
 
-# =============================================================================
 # PRACTICAL SKILLS & GENERAL KNOWLEDGE
-# =============================================================================
 How can I be more productive at work?
 Plan a week-long trip to Japan including must-see attractions.
 Explain how to start a small business step by step.
@@ -196,9 +168,7 @@ What factors should I consider when making a major decision?
 How do I manage personal finances effectively?
 What are the basics of public speaking?
 
-# =============================================================================
 # CREATIVE & COMMUNICATION
-# =============================================================================
 Write a short poem about nature.
 Help me brainstorm ideas for a birthday party.
 Describe a peaceful forest scene.
@@ -210,9 +180,7 @@ Explain the principles of good design.
 How do I give constructive feedback?
 What are techniques for creative brainstorming?
 
-# =============================================================================
 # REASONING & ANALYSIS
-# =============================================================================
 What are the pros and cons of renewable energy?
 Explain the scientific method.
 How do you evaluate the credibility of a source?
