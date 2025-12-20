@@ -94,6 +94,57 @@ QUANT_TYPES = {
 QUANT_ONLY_TYPES = ["Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q3_K_M", "Q3_K_S", "Q2_K"]
 
 
+def _has_vision_weights(model_path: Path) -> bool:
+    """
+    Check if a model has actual vision encoder weights in its files.
+    This is the definitive test for VL capability.
+    """
+    # Check safetensors index for vision-related weight names
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map", {})
+            # Look for vision encoder weight prefixes
+            vision_prefixes = [
+                "vision_tower", "vision_model", "visual_encoder",
+                "vision_encoder", "image_encoder", "vit.", "visual.",
+                "model.vision_tower", "model.vision_model",
+            ]
+            for weight_name in weight_map.keys():
+                weight_lower = weight_name.lower()
+                if any(prefix in weight_lower for prefix in vision_prefixes):
+                    return True
+        except:
+            pass
+
+    # Check single safetensors file
+    single_safetensors = model_path / "model.safetensors"
+    if single_safetensors.exists():
+        try:
+            # Read header only (first 8 bytes = header size, then JSON header)
+            import struct
+            with open(single_safetensors, "rb") as f:
+                header_size = struct.unpack("<Q", f.read(8))[0]
+                header_json = f.read(header_size).decode("utf-8")
+                header = json.loads(header_json)
+                vision_prefixes = [
+                    "vision_tower", "vision_model", "visual_encoder",
+                    "vision_encoder", "image_encoder", "vit.", "visual.",
+                ]
+                for weight_name in header.keys():
+                    if weight_name == "__metadata__":
+                        continue
+                    weight_lower = weight_name.lower()
+                    if any(prefix in weight_lower for prefix in vision_prefixes):
+                        return True
+        except:
+            pass
+
+    return False
+
+
 def detect_vision_model(model_path: Path) -> tuple[bool, Optional[str]]:
     """
     Detect if a model is a Vision-Language (VL) model.
@@ -129,19 +180,12 @@ def detect_vision_model(model_path: Path) -> tuple[bool, Optional[str]]:
         if any(kw in model_type for kw in ["vl", "vision", "llava"]):
             return True, config.get("architectures", [None])[0]
 
-        # Check for vision_config (common in VL models)
-        if "vision_config" in config or "visual" in config:
-            return True, config.get("architectures", [None])[0]
+        arch_name = architectures[0] if architectures else ""
 
-        # Check for image processor config
-        if (model_path / "preprocessor_config.json").exists():
-            try:
-                with open(model_path / "preprocessor_config.json", "r") as f:
-                    preproc = json.load(f)
-                if "image" in preproc.get("processor_class", "").lower():
-                    return True, config.get("architectures", [None])[0]
-            except:
-                pass
+        # Check for actual vision encoder weights in the model files
+        # This is the definitive test - config may have vision_config but no weights
+        if _has_vision_weights(model_path):
+            return True, arch_name or None
 
     except (json.JSONDecodeError, IOError):
         pass
@@ -713,6 +757,143 @@ def export_to_gguf(
         msg = f"Successfully exported to {final_output}"
 
     return True, msg, final_output
+
+
+def export_all_quants(
+    config: GGUFExportConfig,
+    quant_types: Optional[list[str]] = None,
+    keep_f16: bool = True,
+    console: Optional[Console] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> tuple[bool, str, list[Path]]:
+    """
+    Export a model to all GGUF quantization types.
+    Converts to F16 once, then quantizes to each type.
+
+    Args:
+        config: Export configuration (quant_type is ignored, F16 is used as base)
+        quant_types: List of quant types to export. If None, exports all available.
+        keep_f16: Whether to keep the F16 intermediate file
+        console: Rich console for output (optional)
+        progress_callback: Callback for progress updates
+
+    Returns:
+        Tuple of (success, message, list of output paths)
+    """
+    def log(msg: str):
+        if progress_callback:
+            progress_callback(msg)
+        elif console:
+            console.print(msg)
+
+    # Find tools
+    tools = find_gguf_tools(config.llama_cpp_path)
+    if not tools:
+        return False, "Could not find convert_hf_to_gguf.py", []
+
+    if not tools.quantize_exe:
+        return False, "llama-quantize not found - required for multi-quant export", []
+
+    log(f"Found conversion script: {tools.convert_script}")
+    log(f"Found quantize tool: {tools.quantize_exe}")
+
+    # Determine quant types to export
+    if quant_types is None:
+        quant_types = list(QUANT_ONLY_TYPES)  # All quantized types
+
+    # Ensure output directory exists
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    model_name = config.model_name or config.model_path.name
+
+    # Detect VL model
+    is_vl_model = config.is_vision_model
+    if is_vl_model is None:
+        is_vl_model, _ = detect_vision_model(config.model_path)
+
+    # Step 1: Convert to F16 first
+    f16_output = config.output_dir / f"{model_name}-f16.gguf"
+    log(f"Converting {config.model_path} to F16...")
+
+    success = convert_hf_to_gguf(
+        model_path=config.model_path,
+        output_path=f16_output,
+        convert_script=tools.convert_script,
+        outtype="f16",
+        is_vision_model=False,
+        progress_callback=log,
+    )
+
+    if not success or not f16_output.exists():
+        return False, "Failed to convert model to F16 GGUF", []
+
+    f16_size = f16_output.stat().st_size / (1024**3)
+    log(f"Created F16: {f16_output} ({f16_size:.2f} GB)")
+
+    # Step 2: Handle mmproj for VL models
+    if is_vl_model and config.export_mmproj:
+        mmproj_source = None
+        if has_vision_files(config.model_path):
+            mmproj_source = config.model_path
+        elif config.original_model_path and has_vision_files(config.original_model_path):
+            mmproj_source = config.original_model_path
+
+        if mmproj_source:
+            log(f"Converting mmproj from: {mmproj_source}")
+            mmproj_output = config.output_dir / f"mmproj-{model_name}-f16.gguf"
+            convert_hf_to_gguf(
+                model_path=mmproj_source,
+                output_path=mmproj_output,
+                convert_script=tools.convert_script,
+                outtype="f16",
+                is_vision_model=True,
+                progress_callback=log,
+            )
+            if mmproj_output.exists():
+                log(f"Created mmproj: {mmproj_output}")
+
+    # Step 3: Quantize to each type
+    output_paths = []
+    failed_quants = []
+
+    if keep_f16:
+        output_paths.append(f16_output)
+
+    for i, quant_type in enumerate(quant_types, 1):
+        log(f"[{i}/{len(quant_types)}] Quantizing to {quant_type}...")
+
+        quant_output = config.output_dir / f"{model_name}-{quant_type.lower()}.gguf"
+
+        success = quantize_gguf(
+            input_gguf=f16_output,
+            output_gguf=quant_output,
+            quant_type=quant_type,
+            quantize_exe=tools.quantize_exe,
+            progress_callback=log,
+        )
+
+        if success and quant_output.exists():
+            size_gb = quant_output.stat().st_size / (1024**3)
+            log(f"Created {quant_type}: {quant_output} ({size_gb:.2f} GB)")
+            output_paths.append(quant_output)
+        else:
+            log(f"Failed to quantize to {quant_type}")
+            failed_quants.append(quant_type)
+
+    # Step 4: Clean up F16 if not keeping it
+    if not keep_f16 and f16_output.exists():
+        f16_output.unlink()
+        log("Removed intermediate F16 file")
+
+    # Build result message
+    success_count = len(output_paths)
+    total_count = len(quant_types) + (1 if keep_f16 else 0)
+
+    if failed_quants:
+        msg = f"Exported {success_count}/{total_count} quants. Failed: {', '.join(failed_quants)}"
+        return len(output_paths) > 0, msg, output_paths
+    else:
+        msg = f"Successfully exported {success_count} quant types to {config.output_dir}"
+        return True, msg, output_paths
 
 
 def check_tools_available(llama_cpp_path: Optional[Path] = None) -> dict:

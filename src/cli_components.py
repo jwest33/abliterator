@@ -124,6 +124,14 @@ def get_default_config() -> dict:
         "default_num_prompts": 30,
         "default_direction_multiplier": 1.0,
         "default_dtype": "float16",
+        # Biprojection defaults
+        "default_use_biprojection": False,
+        "default_use_per_neuron_norm": False,
+        "default_target_layer_types": ["o_proj", "down_proj"],
+        "default_harmless_boundary": False,
+        "default_harmless_clamp_ratio": 0.1,
+        "default_num_measurement_layers": 2,
+        "default_intervention_range": [0.25, 0.95],
     }
 
 
@@ -505,6 +513,17 @@ def display_config_panel(config: dict, title: str = "Configuration") -> None:
             display_value = f"{value:.2f}"
         elif isinstance(value, Path):
             display_value = str(value)
+        elif isinstance(value, tuple):
+            # Format tuples nicely (e.g., intervention_range)
+            display_value = f"({', '.join(str(v) for v in value)})"
+        elif isinstance(value, list):
+            # Format lists nicely (e.g., target_layer_types)
+            if value:
+                display_value = ", ".join(str(v) for v in value)
+            else:
+                display_value = "[dim]None[/dim]"
+        elif value is None:
+            display_value = "[dim]None[/dim]"
         else:
             display_value = str(value)
 
@@ -643,6 +662,226 @@ def print_divider():
     """Print a horizontal divider."""
     console.print()
     console.rule(style=THEME["muted"])
+    console.print()
+
+
+# ==============================================================================
+# Training Config Display Components
+# ==============================================================================
+
+
+def display_training_config_list(configs: list[dict], title: str = "Saved Training Configs") -> None:
+    """
+    Display a list of training configs in a formatted table.
+
+    Args:
+        configs: List of config metadata dicts from list_configs()
+        title: Title for the table
+    """
+    if not configs:
+        console.print(f"[{THEME['muted']}]No saved configs found.[/{THEME['muted']}]")
+        console.print()
+        return
+
+    table = Table(
+        title=title,
+        show_header=True,
+        header_style=f"bold {THEME['primary']}",
+        border_style=THEME["muted"],
+    )
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Name", style=f"bold {THEME['primary']}")
+    table.add_column("Description", style=THEME["muted"], max_width=40)
+    table.add_column("Last Updated", style="dim")
+
+    for idx, config in enumerate(configs, 1):
+        # Format the date
+        updated = config.get("updated_at", "")
+        if updated:
+            try:
+                # Parse ISO format and display nicely
+                from datetime import datetime
+                dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                updated = dt.strftime("%Y-%m-%d %H:%M")
+            except (ValueError, AttributeError):
+                pass
+
+        # Check for errors
+        if "error" in config:
+            name_display = f"[red]{config['name']}[/red]"
+            desc = f"[red]{config.get('description', 'Error loading')}[/red]"
+        else:
+            name_display = config.get("name", config.get("filename", "Unknown"))
+            desc = config.get("description", "") or "[dim]No description[/dim]"
+
+        # Truncate description if too long
+        if len(desc) > 40:
+            desc = desc[:37] + "..."
+
+        table.add_row(str(idx), name_display, desc, updated)
+
+    console.print(table)
+    console.print()
+
+
+def display_training_config_details(config: dict, title: str = "Config Details") -> None:
+    """
+    Display full training config details in a formatted panel.
+
+    Args:
+        config: Full config dict with metadata and settings
+        title: Title for the panel
+    """
+    # Create metadata section
+    metadata = config.get("metadata", {})
+    settings = config.get("settings", {})
+
+    # Metadata table
+    meta_table = Table(show_header=False, box=None, padding=(0, 2))
+    meta_table.add_column("Key", style=THEME["muted"], width=20)
+    meta_table.add_column("Value", style=THEME["primary"])
+
+    meta_table.add_row("Name", metadata.get("name", "Unknown"))
+    meta_table.add_row("Description", metadata.get("description", "") or "[dim]None[/dim]")
+
+    created = metadata.get("created_at", "")
+    if created:
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            created = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, AttributeError):
+            pass
+    meta_table.add_row("Created", created or "[dim]Unknown[/dim]")
+
+    updated = metadata.get("updated_at", "")
+    if updated:
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            updated = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, AttributeError):
+            pass
+    meta_table.add_row("Last Updated", updated or "[dim]Unknown[/dim]")
+
+    # Settings table
+    settings_table = Table(show_header=False, box=None, padding=(0, 2))
+    settings_table.add_column("Setting", style=THEME["muted"], width=28)
+    settings_table.add_column("Value", style=THEME["primary"])
+
+    # Group settings by category for better readability
+    basic_settings = [
+        ("num_prompts", "Num Prompts"),
+        ("direction_multiplier", "Direction Multiplier"),
+        ("norm_preservation", "Norm Preservation"),
+        ("filter_prompts", "Filter Prompts"),
+        ("device", "Device"),
+        ("dtype", "Dtype"),
+    ]
+
+    stability_settings = [
+        ("use_welford_mean", "Welford Mean"),
+        ("use_float64_subtraction", "Float64 Subtraction"),
+    ]
+
+    winsorization_settings = [
+        ("use_winsorization", "Winsorization"),
+        ("winsorize_percentile", "Winsorize Percentile"),
+        ("use_magnitude_clipping", "Magnitude Clipping"),
+        ("magnitude_clip_percentile", "Magnitude Clip Percentile"),
+    ]
+
+    nullspace_settings = [
+        ("use_null_space", "Null-Space Constraints"),
+        ("preservation_prompts_path", "Preservation Prompts"),
+        ("null_space_rank_ratio", "Null-Space Rank Ratio"),
+    ]
+
+    advanced_settings = [
+        ("use_projected_refusal", "Projected Refusal"),
+        ("use_adaptive_weighting", "Adaptive Weighting"),
+        ("use_biprojection", "Biprojection"),
+        ("use_per_neuron_norm", "Per-Neuron Norm"),
+        ("target_layer_types", "Target Layer Types"),
+        ("use_harmless_boundary", "Harmless Boundary"),
+        ("harmless_clamp_ratio", "Harmless Clamp Ratio"),
+        ("num_measurement_layers", "Measurement Layers"),
+        ("intervention_range", "Intervention Range"),
+    ]
+
+    def format_value(value):
+        """Format a setting value for display."""
+        if isinstance(value, bool):
+            return f"[green]Yes[/green]" if value else f"[red]No[/red]"
+        elif isinstance(value, float):
+            return f"{value:.3f}"
+        elif isinstance(value, list):
+            if value:
+                return ", ".join(str(v) for v in value)
+            return "[dim]None[/dim]"
+        elif value is None:
+            return "[dim]None[/dim]"
+        return str(value)
+
+    # Add basic settings
+    settings_table.add_row("[bold]Basic Settings[/bold]", "")
+    for key, label in basic_settings:
+        if key in settings:
+            settings_table.add_row(f"  {label}", format_value(settings[key]))
+
+    # Add stability settings
+    settings_table.add_row("", "")
+    settings_table.add_row("[bold]Numerical Stability[/bold]", "")
+    for key, label in stability_settings:
+        if key in settings:
+            settings_table.add_row(f"  {label}", format_value(settings[key]))
+
+    # Add winsorization settings (only if enabled)
+    if settings.get("use_winsorization") or settings.get("use_magnitude_clipping"):
+        settings_table.add_row("", "")
+        settings_table.add_row("[bold]Outlier Clipping[/bold]", "")
+        for key, label in winsorization_settings:
+            if key in settings:
+                settings_table.add_row(f"  {label}", format_value(settings[key]))
+
+    # Add null-space settings (only if enabled)
+    if settings.get("use_null_space"):
+        settings_table.add_row("", "")
+        settings_table.add_row("[bold]Null-Space Constraints[/bold]", "")
+        for key, label in nullspace_settings:
+            if key in settings:
+                settings_table.add_row(f"  {label}", format_value(settings[key]))
+
+    # Add advanced settings (only if any are enabled)
+    advanced_enabled = any(
+        settings.get(key) for key, _ in advanced_settings
+        if key in ("use_adaptive_weighting", "use_biprojection", "use_per_neuron_norm", "use_harmless_boundary")
+    )
+    if advanced_enabled:
+        settings_table.add_row("", "")
+        settings_table.add_row("[bold]Advanced Options[/bold]", "")
+        for key, label in advanced_settings:
+            if key in settings:
+                settings_table.add_row(f"  {label}", format_value(settings[key]))
+
+    # Combine into panel
+    from rich.console import Group
+    content = Group(
+        Text("Metadata", style=f"bold {THEME['secondary']}"),
+        meta_table,
+        Text(""),
+        Text("Settings", style=f"bold {THEME['secondary']}"),
+        settings_table,
+    )
+
+    panel = Panel(
+        content,
+        title=f"[bold]{title}[/bold]",
+        border_style=THEME["secondary"],
+        padding=(1, 2),
+        expand=False,
+    )
+    console.print(panel)
     console.print()
 
 

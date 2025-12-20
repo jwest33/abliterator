@@ -24,9 +24,11 @@ from src.abliterate import get_default_prompts_path
 from src.gguf_export import (
     GGUFExportConfig,
     QUANT_TYPES,
+    QUANT_ONLY_TYPES,
     check_tools_available,
     detect_vision_model,
     export_to_gguf,
+    export_all_quants,
     find_llama_cpp_path,
     has_vision_files,
 )
@@ -46,6 +48,8 @@ from src.cli_components import (
     display_results_table,
     display_success,
     display_system_info,
+    display_training_config_details,
+    display_training_config_list,
     display_warning,
     find_models,
     get_config_path,
@@ -64,6 +68,19 @@ from src.cli_components import (
     set_default_output_dir,
     set_eval_results_dir,
     user_prompts_exist,
+)
+from src.config_manager import (
+    config_exists,
+    delete_training_config,
+    get_configs_dir,
+    get_default_settings,
+    list_configs,
+    load_training_config,
+    save_training_config,
+    settings_from_abliteration_config,
+    apply_config_to_runtime,
+    sanitize_config_name,
+    validate_config_settings,
 )
 
 # Questionary custom style (orange theme)
@@ -128,6 +145,30 @@ def select_model(title: str = "Select a model", allow_manual: bool = True) -> Op
 def get_abliteration_config() -> Optional[dict]:
     """Interactive configuration for abliteration."""
     config = {}
+    loaded_settings = None
+
+    # Step 0: Check if user wants to load a saved config
+    saved_configs = list_configs()
+    if saved_configs:
+        console.print(f"\n[bold {THEME['primary']}]Configuration Source[/bold {THEME['primary']}]\n")
+
+        config_choice = questionary.select(
+            "How would you like to configure this abliteration?",
+            choices=[
+                questionary.Choice("New config", value="fresh"),
+                questionary.Choice("Load saved config", value="load"),
+            ],
+            style=custom_style,
+        ).ask()
+
+        if config_choice is None:
+            return None
+
+        if config_choice == "load":
+            loaded_settings = _select_training_config_for_abliteration()
+            if loaded_settings is None:
+                # User cancelled or chose to go back - continue with manual config
+                pass
 
     # Model selection
     console.print(f"\n[bold {THEME['primary']}]Step 1: Select Base Model[/bold {THEME['primary']}]\n")
@@ -156,7 +197,13 @@ def get_abliteration_config() -> Optional[dict]:
             style=custom_style,
         ).ask()
 
-    # Advanced options
+    # If we loaded settings from a config, apply them and skip manual configuration
+    if loaded_settings:
+        config.update(loaded_settings)
+        console.print(f"\n[{THEME['success']}]Using settings from loaded config.[/{THEME['success']}]")
+        return config
+
+    # Manual configuration - Advanced options
     console.print(f"\n[bold {THEME['primary']}]Step 3: Configuration[/bold {THEME['primary']}]\n")
 
     config["num_prompts"] = int(questionary.text(
@@ -211,15 +258,23 @@ def get_abliteration_config() -> Optional[dict]:
     console.print(f"\n[bold {THEME['primary']}]Step 4: Advanced Options[/bold {THEME['primary']}]\n")
 
     use_advanced = questionary.confirm(
-        "Configure advanced options? (Winsorization, null-space constraints)",
+        "Configure advanced options? (Winsorization, null-space, biprojection)",
         default=False,
         style=custom_style,
     ).ask()
 
     # Set defaults
+    config["use_projected_refusal"] = True  # Orthogonalize refusal against harmless (recommended, on by default)
     config["use_winsorization"] = False
     config["use_null_space"] = False
     config["use_adaptive_weighting"] = False
+    config["use_biprojection"] = False
+    config["use_per_neuron_norm"] = False
+    config["target_layer_types"] = None
+    config["use_harmless_boundary"] = False
+    config["harmless_clamp_ratio"] = 0.1
+    config["num_measurement_layers"] = 2
+    config["intervention_range"] = (0.25, 0.95)
 
     if use_advanced:
         # Winsorization (recommended for Gemma models)
@@ -270,6 +325,93 @@ def get_abliteration_config() -> Optional[dict]:
             default=False,
             style=custom_style,
         ).ask()
+
+        # Biprojection options
+        console.print(f"\n[bold {THEME['secondary']}]Biprojection (improved NatInt preservation)[/bold {THEME['secondary']}]")
+
+        config["use_biprojection"] = questionary.confirm(
+            "Enable biprojection mode? (measure at high-quality layers, apply broadly)",
+            default=False,
+            style=custom_style,
+        ).ask()
+
+        if config["use_biprojection"]:
+            config["use_per_neuron_norm"] = questionary.confirm(
+                "Use per-neuron norm preservation? (recommended for biprojection)",
+                default=True,
+                style=custom_style,
+            ).ask()
+
+            # Target layer types
+            use_target_layers = questionary.confirm(
+                "Target specific layer types? (Recommended: o_proj, down_proj only)",
+                default=True,
+                style=custom_style,
+            ).ask()
+
+            if use_target_layers:
+                selected_layers = questionary.checkbox(
+                    "Select layer types to target:",
+                    choices=[
+                        questionary.Choice("o_proj (attention output)", value="o_proj", checked=True),
+                        questionary.Choice("down_proj (MLP output)", value="down_proj", checked=True),
+                        questionary.Choice("q_proj (attention query)", value="q_proj"),
+                        questionary.Choice("k_proj (attention key)", value="k_proj"),
+                        questionary.Choice("v_proj (attention value)", value="v_proj"),
+                        questionary.Choice("gate_proj (MLP gate)", value="gate_proj"),
+                        questionary.Choice("up_proj (MLP up)", value="up_proj"),
+                    ],
+                    style=custom_style,
+                ).ask()
+                config["target_layer_types"] = selected_layers if selected_layers else None
+
+            config["use_harmless_boundary"] = questionary.confirm(
+                "Enable harmless direction boundary clamping? (prevents over-ablation)",
+                default=True,
+                style=custom_style,
+            ).ask()
+
+            if config["use_harmless_boundary"]:
+                config["harmless_clamp_ratio"] = float(questionary.text(
+                    "Harmless clamp ratio (0.0-1.0):",
+                    default="0.1",
+                    style=custom_style,
+                ).ask())
+
+            # Advanced biprojection settings
+            configure_biprojection_advanced = questionary.confirm(
+                "Configure advanced biprojection settings? (measurement layers, intervention range)",
+                default=False,
+                style=custom_style,
+            ).ask()
+
+            if configure_biprojection_advanced:
+                config["num_measurement_layers"] = int(questionary.text(
+                    "Number of measurement layers (top quality):",
+                    default="2",
+                    style=custom_style,
+                ).ask())
+
+                intervention_start = float(questionary.text(
+                    "Intervention range start (0.0-1.0, fraction of depth):",
+                    default="0.25",
+                    style=custom_style,
+                ).ask())
+
+                intervention_end = float(questionary.text(
+                    "Intervention range end (0.0-1.0, fraction of depth):",
+                    default="0.95",
+                    style=custom_style,
+                ).ask())
+
+                config["intervention_range"] = (intervention_start, intervention_end)
+        else:
+            # Allow per-neuron norm even without full biprojection
+            config["use_per_neuron_norm"] = questionary.confirm(
+                "Use per-neuron norm preservation?",
+                default=False,
+                style=custom_style,
+            ).ask()
 
     return config
 
@@ -344,6 +486,14 @@ def run_abliteration(config: dict) -> bool:
                 preservation_prompts_path=config.get("preservation_prompts_path"),
                 null_space_rank_ratio=config.get("null_space_rank_ratio", 0.95),
                 use_adaptive_weighting=config.get("use_adaptive_weighting", False),
+                use_projected_refusal=config.get("use_projected_refusal", True),
+                use_biprojection=config.get("use_biprojection", False),
+                use_per_neuron_norm=config.get("use_per_neuron_norm", False),
+                target_layer_types=config.get("target_layer_types"),
+                use_harmless_boundary=config.get("use_harmless_boundary", False),
+                harmless_clamp_ratio=config.get("harmless_clamp_ratio", 0.1),
+                num_measurement_layers=config.get("num_measurement_layers", 2),
+                intervention_range=config.get("intervention_range", (0.25, 0.95)),
             )
 
             # Filter prompts if enabled
@@ -745,6 +895,13 @@ def run_gguf_export():
         questionary.Choice("F16 - 16-bit float (no quantization)", value="F16"),
     ]
 
+    # If quantize tool available, add "Export all" option
+    if tools_status["can_quantize"]:
+        quant_choices.insert(0, questionary.Choice(
+            "★ Export ALL quant types (Q2_K through Q8_0 + F16)",
+            value="ALL"
+        ))
+
     # If quantize tool not available, only offer F16/F32
     if not tools_status["can_quantize"]:
         quant_choices = [
@@ -760,6 +917,21 @@ def run_gguf_export():
 
     if not quant_type:
         return
+
+    # Handle "Export all" selection
+    export_all = quant_type == "ALL"
+    keep_f16 = True  # Default for export all
+
+    if export_all:
+        # Ask if user wants to keep F16
+        keep_f16 = questionary.confirm(
+            "Keep the F16 file? (used as base for quantization)",
+            default=True,
+            style=custom_style,
+        ).ask()
+
+        if keep_f16 is None:
+            return
 
     # Select output directory
     default_output = config.get("default_output_dir", "./abliterate/abliterated_models")
@@ -789,7 +961,11 @@ def run_gguf_export():
     console.print(f"\n[bold]Export Configuration:[/bold]")
     console.print(f"  Model: [{THEME['primary']}]{model_path}[/{THEME['primary']}]")
     console.print(f"  Output: [{THEME['primary']}]{output_dir}[/{THEME['primary']}]")
-    console.print(f"  Format: [{THEME['accent']}]{quant_type}[/{THEME['accent']}]")
+    if export_all:
+        console.print(f"  Format: [{THEME['accent']}]ALL quant types[/{THEME['accent']}]")
+        console.print(f"  Types: [{THEME['muted']}]{', '.join(QUANT_ONLY_TYPES)}{' + F16' if keep_f16 else ''}[/{THEME['muted']}]")
+    else:
+        console.print(f"  Format: [{THEME['accent']}]{quant_type}[/{THEME['accent']}]")
     console.print(f"  Name: [{THEME['primary']}]{model_name}[/{THEME['primary']}]")
     if is_vl_model:
         console.print(f"  Type: [{THEME['accent']}]Vision-Language (VL) model[/{THEME['accent']}]")
@@ -807,68 +983,661 @@ def run_gguf_export():
 
     # Run the export
     console.print()
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Exporting to GGUF...", total=None)
 
-        def progress_callback(msg: str):
-            progress.update(task, description=msg)
+    export_config = GGUFExportConfig(
+        model_path=Path(model_path),
+        output_dir=output_dir,
+        quant_type=quant_type if not export_all else "F16",
+        llama_cpp_path=llama_cpp_path,
+        model_name=model_name,
+        is_vision_model=is_vl_model,
+        original_model_path=Path(original_model_path) if original_model_path else None,
+    )
 
-        export_config = GGUFExportConfig(
-            model_path=Path(model_path),
-            output_dir=output_dir,
-            quant_type=quant_type,
-            llama_cpp_path=llama_cpp_path,
-            model_name=model_name,
-            is_vision_model=is_vl_model,
-            original_model_path=Path(original_model_path) if original_model_path else None,
-        )
+    if export_all:
+        # Export all quant types
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Exporting all quant types...", total=None)
 
-        success, message, output_path = export_to_gguf(
-            config=export_config,
-            progress_callback=progress_callback,
-        )
+            def progress_callback(msg: str):
+                progress.update(task, description=msg)
 
-    console.print()
-    if success:
-        display_success(message)
-        if output_path and output_path.exists():
-            size_gb = output_path.stat().st_size / (1024**3)
-            console.print(f"  Model size: [{THEME['accent']}]{size_gb:.2f} GB[/{THEME['accent']}]")
+            success, message, output_paths = export_all_quants(
+                config=export_config,
+                keep_f16=keep_f16,
+                progress_callback=progress_callback,
+            )
 
-        # Check for mmproj file for VL models
-        # The --mmproj flag adds "mmproj-" prefix to the output filename
-        if is_vl_model:
-            mmproj_patterns = [
-                output_dir / f"mmproj-{model_name}-f16.gguf",  # Main pattern from --mmproj flag
-                output_dir / f"{model_name}-mmproj-f16.gguf",  # Alternative naming
-            ]
-            mmproj_found = False
-            for mmproj_path in mmproj_patterns:
-                if mmproj_path.exists():
-                    size_mb = mmproj_path.stat().st_size / (1024**2)
-                    console.print(f"  mmproj size: [{THEME['accent']}]{size_mb:.1f} MB[/{THEME['accent']}]")
-                    console.print(f"  mmproj path: [{THEME['muted']}]{mmproj_path}[/{THEME['muted']}]")
-                    mmproj_found = True
-                    break
+        console.print()
+        if success:
+            display_success(message)
+            console.print(f"\n[bold]Created files:[/bold]")
+            for path in output_paths:
+                if path.exists():
+                    size_gb = path.stat().st_size / (1024**3)
+                    console.print(f"  [{THEME['muted']}]{path.name}[/{THEME['muted']}] - [{THEME['accent']}]{size_gb:.2f} GB[/{THEME['accent']}]")
 
-            if not mmproj_found:
-                # Check for any mmproj file in output directory
+            # Check for mmproj file for VL models
+            if is_vl_model:
                 for f in output_dir.glob("*mmproj*.gguf"):
                     size_mb = f.stat().st_size / (1024**2)
-                    console.print(f"  mmproj size: [{THEME['accent']}]{size_mb:.1f} MB[/{THEME['accent']}]")
-                    console.print(f"  mmproj path: [{THEME['muted']}]{f}[/{THEME['muted']}]")
-                    mmproj_found = True
+                    console.print(f"  [{THEME['muted']}]{f.name}[/{THEME['muted']}] - [{THEME['accent']}]{size_mb:.1f} MB[/{THEME['accent']}] (mmproj)")
                     break
+        else:
+            display_error(message)
+    else:
+        # Single quant type export
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Exporting to GGUF...", total=None)
 
-            if not mmproj_found:
-                console.print(f"  [{THEME['warning']}]mmproj not found - vision features may not work[/{THEME['warning']}]")
-                console.print(f"  [{THEME['muted']}]You may need to manually convert the vision encoder[/{THEME['muted']}]")
+            def progress_callback(msg: str):
+                progress.update(task, description=msg)
+
+            success, message, output_path = export_to_gguf(
+                config=export_config,
+                progress_callback=progress_callback,
+            )
+
+        console.print()
+        if success:
+            display_success(message)
+            if output_path and output_path.exists():
+                size_gb = output_path.stat().st_size / (1024**3)
+                console.print(f"  Model size: [{THEME['accent']}]{size_gb:.2f} GB[/{THEME['accent']}]")
+
+            # Check for mmproj file for VL models
+            # The --mmproj flag adds "mmproj-" prefix to the output filename
+            if is_vl_model:
+                mmproj_patterns = [
+                    output_dir / f"mmproj-{model_name}-f16.gguf",  # Main pattern from --mmproj flag
+                    output_dir / f"{model_name}-mmproj-f16.gguf",  # Alternative naming
+                ]
+                mmproj_found = False
+                for mmproj_path in mmproj_patterns:
+                    if mmproj_path.exists():
+                        size_mb = mmproj_path.stat().st_size / (1024**2)
+                        console.print(f"  mmproj size: [{THEME['accent']}]{size_mb:.1f} MB[/{THEME['accent']}]")
+                        console.print(f"  mmproj path: [{THEME['muted']}]{mmproj_path}[/{THEME['muted']}]")
+                        mmproj_found = True
+                        break
+
+                if not mmproj_found:
+                    # Check for any mmproj file in output directory
+                    for f in output_dir.glob("*mmproj*.gguf"):
+                        size_mb = f.stat().st_size / (1024**2)
+                        console.print(f"  mmproj size: [{THEME['accent']}]{size_mb:.1f} MB[/{THEME['accent']}]")
+                        console.print(f"  mmproj path: [{THEME['muted']}]{f}[/{THEME['muted']}]")
+                        mmproj_found = True
+                        break
+
+                if not mmproj_found:
+                    console.print(f"  [{THEME['warning']}]mmproj not found - vision features may not work[/{THEME['warning']}]")
+                    console.print(f"  [{THEME['muted']}]You may need to manually convert the vision encoder[/{THEME['muted']}]")
+        else:
+            display_error(message)
+
+
+# ==============================================================================
+# Training Config Management
+# ==============================================================================
+
+
+def run_config_management():
+    """Training config management menu."""
+    while True:
+        console.print(f"\n[bold {THEME['primary']}]Training Configs[/bold {THEME['primary']}]\n")
+        console.print(f"[{THEME['muted']}]Configs stored in: {get_configs_dir()}[/{THEME['muted']}]\n")
+
+        action = questionary.select(
+            "What would you like to do?",
+            choices=[
+                questionary.Choice("Create new config", value="create"),
+                questionary.Choice("View saved configs", value="view"),
+                questionary.Choice("Edit config", value="edit"),
+                questionary.Choice("Delete config", value="delete"),
+                questionary.Choice("Back", value="back"),
+            ],
+            style=custom_style,
+        ).ask()
+
+        if action == "back" or action is None:
+            break
+
+        elif action == "create":
+            _create_training_config()
+
+        elif action == "view":
+            _view_training_configs()
+
+        elif action == "edit":
+            _edit_training_config()
+
+        elif action == "delete":
+            _delete_training_config()
+
+
+def _create_training_config():
+    """Create a new training config via questionnaire."""
+    console.print(f"\n[bold {THEME['primary']}]Create New Training Config[/bold {THEME['primary']}]\n")
+
+    # Get config name
+    name = questionary.text(
+        "Config name:",
+        style=custom_style,
+    ).ask()
+
+    if not name:
+        display_warning("Config name required.")
+        return
+
+    # Check if exists
+    sanitized = sanitize_config_name(name)
+    if config_exists(sanitized):
+        overwrite = questionary.confirm(
+            f"Config '{sanitized}' already exists. Overwrite?",
+            default=False,
+            style=custom_style,
+        ).ask()
+        if not overwrite:
+            return
+
+    # Get description
+    description = questionary.text(
+        "Description (optional):",
+        default="",
+        style=custom_style,
+    ).ask() or ""
+
+    # Collect settings via questionnaire
+    settings = _collect_config_settings()
+    if settings is None:
+        return
+
+    # Save config
+    success, message = save_training_config(name, settings, description, overwrite=True)
+    if success:
+        display_success(f"Config '{sanitized}' created successfully!")
     else:
         display_error(message)
+
+
+def _collect_config_settings() -> Optional[dict]:
+    """Collect abliteration settings via questionnaire. Returns None if cancelled."""
+    settings = get_default_settings()
+
+    console.print(f"\n[bold {THEME['secondary']}]Basic Settings[/bold {THEME['secondary']}]\n")
+
+    # Number of prompts
+    num_prompts = questionary.text(
+        "Number of prompts:",
+        default=str(settings["num_prompts"]),
+        style=custom_style,
+    ).ask()
+    if num_prompts is None:
+        return None
+    try:
+        settings["num_prompts"] = int(num_prompts)
+    except ValueError:
+        display_warning("Invalid number, using default.")
+
+    # Direction multiplier
+    multiplier = questionary.text(
+        "Direction multiplier (0.0-2.0):",
+        default=str(settings["direction_multiplier"]),
+        style=custom_style,
+    ).ask()
+    if multiplier is None:
+        return None
+    try:
+        settings["direction_multiplier"] = float(multiplier)
+    except ValueError:
+        display_warning("Invalid number, using default.")
+
+    # Norm preservation
+    settings["norm_preservation"] = questionary.confirm(
+        "Enable norm preservation?",
+        default=settings["norm_preservation"],
+        style=custom_style,
+    ).ask()
+    if settings["norm_preservation"] is None:
+        return None
+
+    # Filter prompts
+    settings["filter_prompts"] = questionary.confirm(
+        "Filter harmful prompts by refusal?",
+        default=settings["filter_prompts"],
+        style=custom_style,
+    ).ask()
+    if settings["filter_prompts"] is None:
+        return None
+
+    # Device
+    settings["device"] = questionary.select(
+        "Device:",
+        choices=["cuda", "cpu"],
+        default=settings["device"],
+        style=custom_style,
+    ).ask()
+    if settings["device"] is None:
+        return None
+
+    # Dtype
+    settings["dtype"] = questionary.select(
+        "Precision:",
+        choices=["float16", "bfloat16", "float32"],
+        default=settings["dtype"],
+        style=custom_style,
+    ).ask()
+    if settings["dtype"] is None:
+        return None
+
+    # Advanced options
+    configure_advanced = questionary.confirm(
+        "\nConfigure advanced options?",
+        default=False,
+        style=custom_style,
+    ).ask()
+
+    if configure_advanced:
+        console.print(f"\n[bold {THEME['secondary']}]Advanced Settings[/bold {THEME['secondary']}]\n")
+
+        # Winsorization
+        settings["use_winsorization"] = questionary.confirm(
+            "Enable per-dimension Winsorization?",
+            default=settings["use_winsorization"],
+            style=custom_style,
+        ).ask()
+        if settings["use_winsorization"] is None:
+            return None
+
+        if settings["use_winsorization"]:
+            percentile = questionary.text(
+                "Winsorize percentile (0.99-0.999):",
+                default=str(settings["winsorize_percentile"]),
+                style=custom_style,
+            ).ask()
+            try:
+                settings["winsorize_percentile"] = float(percentile)
+            except (ValueError, TypeError):
+                pass
+
+        # Magnitude clipping
+        settings["use_magnitude_clipping"] = questionary.confirm(
+            "Enable global magnitude clipping?",
+            default=settings["use_magnitude_clipping"],
+            style=custom_style,
+        ).ask()
+        if settings["use_magnitude_clipping"] is None:
+            return None
+
+        if settings["use_magnitude_clipping"]:
+            percentile = questionary.text(
+                "Magnitude clip percentile:",
+                default=str(settings["magnitude_clip_percentile"]),
+                style=custom_style,
+            ).ask()
+            try:
+                settings["magnitude_clip_percentile"] = float(percentile)
+            except (ValueError, TypeError):
+                pass
+
+        # Null-space constraints
+        settings["use_null_space"] = questionary.confirm(
+            "Enable null-space constraints?",
+            default=settings["use_null_space"],
+            style=custom_style,
+        ).ask()
+        if settings["use_null_space"] is None:
+            return None
+
+        if settings["use_null_space"]:
+            ratio = questionary.text(
+                "Null-space rank ratio (0.9-0.99):",
+                default=str(settings["null_space_rank_ratio"]),
+                style=custom_style,
+            ).ask()
+            try:
+                settings["null_space_rank_ratio"] = float(ratio)
+            except (ValueError, TypeError):
+                pass
+
+        # Adaptive weighting
+        settings["use_adaptive_weighting"] = questionary.confirm(
+            "Enable adaptive layer weighting?",
+            default=settings["use_adaptive_weighting"],
+            style=custom_style,
+        ).ask()
+        if settings["use_adaptive_weighting"] is None:
+            return None
+
+        # Biprojection
+        settings["use_biprojection"] = questionary.confirm(
+            "Enable biprojection mode?",
+            default=settings["use_biprojection"],
+            style=custom_style,
+        ).ask()
+        if settings["use_biprojection"] is None:
+            return None
+
+        if settings["use_biprojection"]:
+            settings["use_per_neuron_norm"] = questionary.confirm(
+                "Use per-neuron norm preservation?",
+                default=settings["use_per_neuron_norm"],
+                style=custom_style,
+            ).ask()
+
+            # Target layer types
+            target_layers = questionary.checkbox(
+                "Target layer types:",
+                choices=[
+                    questionary.Choice("o_proj", checked=True),
+                    questionary.Choice("down_proj", checked=True),
+                    questionary.Choice("gate_proj", checked=False),
+                    questionary.Choice("up_proj", checked=False),
+                    questionary.Choice("q_proj", checked=False),
+                    questionary.Choice("k_proj", checked=False),
+                    questionary.Choice("v_proj", checked=False),
+                ],
+                style=custom_style,
+            ).ask()
+            if target_layers:
+                settings["target_layer_types"] = target_layers
+
+            settings["use_harmless_boundary"] = questionary.confirm(
+                "Enable harmless boundary clamping?",
+                default=settings["use_harmless_boundary"],
+                style=custom_style,
+            ).ask()
+
+            if settings["use_harmless_boundary"]:
+                ratio = questionary.text(
+                    "Harmless clamp ratio (0.0-1.0):",
+                    default=str(settings["harmless_clamp_ratio"]),
+                    style=custom_style,
+                ).ask()
+                try:
+                    settings["harmless_clamp_ratio"] = float(ratio)
+                except (ValueError, TypeError):
+                    pass
+
+    # Validate settings
+    is_valid, errors = validate_config_settings(settings)
+    if not is_valid:
+        display_warning("Some settings may be invalid:")
+        for error in errors:
+            console.print(f"  [{THEME['warning']}]- {error}[/{THEME['warning']}]")
+
+    return settings
+
+
+def _view_training_configs():
+    """View saved training configs."""
+    configs = list_configs()
+
+    if not configs:
+        console.print(f"\n[{THEME['muted']}]No saved configs found.[/{THEME['muted']}]")
+        console.print(f"[{THEME['muted']}]Use 'Create new config' to create one.[/{THEME['muted']}]\n")
+        return
+
+    console.print()
+    display_training_config_list(configs)
+
+    # Offer to view details
+    choices = [
+        questionary.Choice(f"{c['name']}", value=c["filename"])
+        for c in configs if "error" not in c
+    ]
+    choices.append(questionary.Choice("Back", value="back"))
+
+    selected = questionary.select(
+        "View config details:",
+        choices=choices,
+        style=custom_style,
+    ).ask()
+
+    if selected and selected != "back":
+        config = load_training_config(selected)
+        if config:
+            console.print()
+            display_training_config_details(config, f"Config: {config['metadata'].get('name', selected)}")
+
+
+def _edit_training_config():
+    """Edit an existing training config."""
+    configs = list_configs()
+
+    if not configs:
+        console.print(f"\n[{THEME['muted']}]No saved configs found.[/{THEME['muted']}]\n")
+        return
+
+    # Select config to edit
+    choices = [
+        questionary.Choice(f"{c['name']}", value=c["filename"])
+        for c in configs if "error" not in c
+    ]
+    choices.append(questionary.Choice("Back", value="back"))
+
+    console.print()
+    display_training_config_list(configs)
+
+    selected = questionary.select(
+        "Select config to edit:",
+        choices=choices,
+        style=custom_style,
+    ).ask()
+
+    if not selected or selected == "back":
+        return
+
+    config = load_training_config(selected)
+    if not config:
+        display_error(f"Failed to load config '{selected}'")
+        return
+
+    # Show current config
+    console.print()
+    display_training_config_details(config, f"Current: {config['metadata'].get('name', selected)}")
+
+    # What to edit?
+    edit_action = questionary.select(
+        "What would you like to edit?",
+        choices=[
+            questionary.Choice("Edit description only", value="description"),
+            questionary.Choice("Re-configure all settings", value="all"),
+            questionary.Choice("Cancel", value="cancel"),
+        ],
+        style=custom_style,
+    ).ask()
+
+    if edit_action == "cancel" or edit_action is None:
+        return
+
+    from src.config_manager import update_training_config
+
+    if edit_action == "description":
+        new_desc = questionary.text(
+            "New description:",
+            default=config["metadata"].get("description", ""),
+            style=custom_style,
+        ).ask()
+        if new_desc is not None:
+            success, message = update_training_config(selected, description=new_desc)
+            if success:
+                display_success("Description updated!")
+            else:
+                display_error(message)
+
+    elif edit_action == "all":
+        new_settings = _collect_config_settings()
+        if new_settings:
+            success, message = update_training_config(selected, settings=new_settings)
+            if success:
+                display_success("Config updated!")
+            else:
+                display_error(message)
+
+
+def _delete_training_config():
+    """Delete a training config."""
+    configs = list_configs()
+
+    if not configs:
+        console.print(f"\n[{THEME['muted']}]No saved configs found.[/{THEME['muted']}]\n")
+        return
+
+    # Select config to delete
+    choices = [
+        questionary.Choice(f"{c['name']}", value=c["filename"])
+        for c in configs
+    ]
+    choices.append(questionary.Choice("Back", value="back"))
+
+    console.print()
+    display_training_config_list(configs)
+
+    selected = questionary.select(
+        "Select config to delete:",
+        choices=choices,
+        style=custom_style,
+    ).ask()
+
+    if not selected or selected == "back":
+        return
+
+    # Load and show config
+    config = load_training_config(selected)
+    if config:
+        console.print()
+        display_training_config_details(config, f"Delete: {config['metadata'].get('name', selected)}")
+
+    # Confirm deletion by typing name
+    config_name = config["metadata"].get("name", selected) if config else selected
+    console.print(f"\n[{THEME['warning']}]Type the config name to confirm deletion:[/{THEME['warning']}]")
+
+    confirmation = questionary.text(
+        f"Type '{config_name}' to confirm:",
+        style=custom_style,
+    ).ask()
+
+    if confirmation == config_name:
+        success, message = delete_training_config(selected)
+        if success:
+            display_success(f"Config '{config_name}' deleted!")
+        else:
+            display_error(message)
+    else:
+        console.print(f"[{THEME['muted']}]Deletion cancelled (name didn't match).[/{THEME['muted']}]")
+
+
+def _select_training_config_for_abliteration() -> Optional[dict]:
+    """Select a training config to use for abliteration. Returns config settings or None."""
+    configs = list_configs()
+
+    if not configs:
+        console.print(f"\n[{THEME['muted']}]No saved configs found.[/{THEME['muted']}]")
+        return None
+
+    console.print()
+    display_training_config_list(configs)
+
+    # Select config
+    choices = [
+        questionary.Choice(f"{c['name']} - {c.get('description', '')[:30]}", value=c["filename"])
+        for c in configs if "error" not in c
+    ]
+    choices.append(questionary.Choice("Back (configure manually)", value="back"))
+
+    selected = questionary.select(
+        "Select config to use:",
+        choices=choices,
+        style=custom_style,
+    ).ask()
+
+    if not selected or selected == "back":
+        return None
+
+    config = load_training_config(selected)
+    if not config:
+        display_error(f"Failed to load config '{selected}'")
+        return None
+
+    # Show config details
+    console.print()
+    display_training_config_details(config, f"Using: {config['metadata'].get('name', selected)}")
+
+    confirm = questionary.confirm(
+        "Use this config?",
+        default=True,
+        style=custom_style,
+    ).ask()
+
+    if confirm:
+        return config["settings"]
+    return None
+
+
+def _prompt_save_config_after_abliteration(config: dict) -> None:
+    """Prompt user to save abliteration settings as a training config."""
+    save_config_prompt = questionary.confirm(
+        "\nWould you like to save these settings as a training config?",
+        default=False,
+        style=custom_style,
+    ).ask()
+
+    if not save_config_prompt:
+        return
+
+    # Get config name
+    name = questionary.text(
+        "Config name:",
+        style=custom_style,
+    ).ask()
+
+    if not name:
+        display_warning("Config name required, not saved.")
+        return
+
+    # Get description
+    description = questionary.text(
+        "Description (optional):",
+        default="",
+        style=custom_style,
+    ).ask() or ""
+
+    # Extract saveable settings
+    settings = settings_from_abliteration_config(config)
+
+    # Check if exists
+    sanitized = sanitize_config_name(name)
+    overwrite = False
+    if config_exists(sanitized):
+        overwrite = questionary.confirm(
+            f"Config '{sanitized}' already exists. Overwrite?",
+            default=False,
+            style=custom_style,
+        ).ask()
+        if not overwrite:
+            return
+
+    # Save
+    success, message = save_training_config(name, settings, description, overwrite=overwrite)
+    if success:
+        display_success(f"Config saved as '{sanitized}'!")
+    else:
+        display_error(message)
+
+
+# ==============================================================================
+# Settings Management
+# ==============================================================================
 
 
 def run_settings():
@@ -1397,7 +2166,8 @@ def main_menu():
                 ("3", "Compare Models", "Side-by-side comparison"),
                 ("4", "Evaluate Refusal", "Full refusal rate evaluation"),
                 ("5", "Export to GGUF", "Quantize for llama.cpp"),
-                ("6", "Settings", "Configure options"),
+                ("6", "Manage Configs", "Create, edit, delete training configs"),
+                ("7", "Settings", "Configure options"),
             ]
         )
 
@@ -1422,6 +2192,8 @@ def main_menu():
                 ).ask()
                 if confirm:
                     run_abliteration(config)
+                    # Prompt to save config after successful abliteration
+                    _prompt_save_config_after_abliteration(config)
                     questionary.press_any_key_to_continue(style=custom_style).ask()
 
         elif choice == "2":
@@ -1441,6 +2213,10 @@ def main_menu():
             questionary.press_any_key_to_continue(style=custom_style).ask()
 
         elif choice == "6":
+            run_config_management()
+            questionary.press_any_key_to_continue(style=custom_style).ask()
+
+        elif choice == "7":
             run_settings()
             questionary.press_any_key_to_continue(style=custom_style).ask()
 
@@ -1463,10 +2239,22 @@ def main_menu():
 @click.option("--preservation-prompts", type=str, default=None, help="Path to preservation prompts file")
 @click.option("--null-space-rank-ratio", type=float, default=0.95, help="Null-space SVD rank ratio (0.9-0.99)")
 @click.option("--adaptive-weighting/--no-adaptive-weighting", default=False, help="Enable adaptive layer weighting")
+
+@click.option("--projected/--no-projected", default=True, help="Orthogonalize refusal against harmless direction (recommended)")
+@click.option("--biprojection/--no-biprojection", default=False, help="Enable biprojection mode")
+@click.option("--per-neuron-norm/--frobenius-norm", default=False, help="Use per-neuron norm preservation")
+@click.option("--target-layers", type=str, default=None, help="Comma-separated layer types (e.g., 'o_proj,down_proj')")
+@click.option("--harmless-boundary/--no-harmless-boundary", default=False, help="Clamp ablation to preserve harmless direction")
+@click.option("--harmless-clamp-ratio", type=float, default=0.1, help="Harmless boundary clamp ratio (0.0-1.0)")
+@click.option("--num-measurement-layers", type=int, default=2, help="Number of high-quality layers for biprojection")
+@click.option("--intervention-start", type=float, default=0.25, help="Intervention range start (0.0-1.0)")
+@click.option("--intervention-end", type=float, default=0.95, help="Intervention range end (0.0-1.0)")
 def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
         no_norm_preservation, no_filter_prompts, device, dtype,
         winsorize, winsorize_percentile, null_space, preservation_prompts,
-        null_space_rank_ratio, adaptive_weighting):
+        null_space_rank_ratio, adaptive_weighting,
+        projected, biprojection, per_neuron_norm, target_layers, harmless_boundary,
+        harmless_clamp_ratio, num_measurement_layers, intervention_start, intervention_end):
     """
     Abliteration Toolkit - Remove refusal behavior from language models.
 
@@ -1474,10 +2262,18 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
 
     Advanced options enable research-backed enhancements:
     \b
+      --projected              Orthogonalize refusal against harmless direction (default: on)
       --winsorize              Clip outlier activations (recommended for Gemma models)
       --null-space             Preserve model capabilities using null-space constraints
       --preservation-prompts   Custom prompts for null-space computation
       --adaptive-weighting     Per-layer adaptive ablation strength
+
+    Biprojection options (improved NatInt preservation):
+    \b
+      --biprojection           Enable biprojection mode (measure at high-quality layers)
+      --per-neuron-norm        Per-neuron norm preservation instead of Frobenius
+      --target-layers          Only ablate specific layer types (e.g., 'o_proj,down_proj')
+      --harmless-boundary      Clamp ablation to preserve harmless direction
     """
     if batch:
         if not model_path:
@@ -1497,6 +2293,11 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
             model_name = Path(model_path).name
             effective_output_path = f"{output_dir}/{model_name}-abliterated"
 
+        # Parse target layers if provided
+        parsed_target_layers = None
+        if target_layers:
+            parsed_target_layers = [t.strip() for t in target_layers.split(",")]
+
         config = {
             "model_path": model_path,
             "output_path": effective_output_path,
@@ -1513,6 +2314,16 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
             "preservation_prompts_path": preservation_prompts,
             "null_space_rank_ratio": null_space_rank_ratio,
             "use_adaptive_weighting": adaptive_weighting,
+            # Projected abliteration (orthogonalize against harmless)
+            "use_projected_refusal": projected,
+            # Biprojection options
+            "use_biprojection": biprojection,
+            "use_per_neuron_norm": per_neuron_norm,
+            "target_layer_types": parsed_target_layers,
+            "use_harmless_boundary": harmless_boundary,
+            "harmless_clamp_ratio": harmless_clamp_ratio,
+            "num_measurement_layers": num_measurement_layers,
+            "intervention_range": (intervention_start, intervention_end),
         }
 
         display_banner()

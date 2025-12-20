@@ -8,5 +8,5 @@ NOTES.md
 venv/*
 .env
 lm-evaluation-harness/
-eval_results/*
+eval_abliterated/*
 abliteration.egg-info

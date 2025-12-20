@@ -28,8 +28,9 @@ VL_ARCHITECTURES = {
 
 # Architectures that need special text-only loading even though they're multimodal
 # These use ForConditionalGeneration but can be loaded with the text-only model class
+# NOTE: Removed Gemma3 - forcing text-only class drops vision encoder params
 FORCE_TEXT_MODEL_ARCHITECTURES = {
-    "Gemma3ForConditionalGeneration": "Gemma3ForCausalLM",
+    # "Gemma3ForConditionalGeneration": "Gemma3ForCausalLM",  # Drops ~400M vision params
 }
 
 
@@ -131,7 +132,7 @@ def load_model_and_tokenizer(
 
             model = AutoModelForImageTextToText.from_pretrained(
                 model_path,
-                dtype=dtype,
+                torch_dtype=dtype,
                 device_map=device,
                 trust_remote_code=trust_remote_code,
             )
@@ -151,14 +152,14 @@ def load_model_and_tokenizer(
                 logger.warning(f"Could not find {force_text_class}, falling back to AutoModelForCausalLM")
                 model = AutoModelForCausalLM.from_pretrained(
                     model_path,
-                    dtype=dtype,
+                    torch_dtype=dtype,
                     device_map=device,
                     trust_remote_code=trust_remote_code,
                 )
             else:
                 model = model_class.from_pretrained(
                     model_path,
-                    dtype=dtype,
+                    torch_dtype=dtype,
                     device_map=device,
                     trust_remote_code=trust_remote_code,
                 )
@@ -166,7 +167,7 @@ def load_model_and_tokenizer(
             logger.warning(f"Failed to load with {force_text_class}: {e}, falling back to AutoModelForCausalLM")
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
-                dtype=dtype,
+                torch_dtype=dtype,
                 device_map=device,
                 trust_remote_code=trust_remote_code,
             )
@@ -174,7 +175,7 @@ def load_model_and_tokenizer(
         logger.info(f"Loading model with AutoModelForCausalLM...")
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            dtype=dtype,
+            torch_dtype=dtype,
             device_map=device,
             trust_remote_code=trust_remote_code,
         )

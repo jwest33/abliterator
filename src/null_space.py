@@ -57,7 +57,7 @@ class NullSpaceConfig:
     per_layer_null_space: bool = True  # Compute separate null space per layer
 
     # Memory optimization
-    chunk_size: int = 100  # Process preservation prompts in chunks
+    chunk_size: int = 4  # Process preservation prompts in chunks (small for numerical stability)
 
 
 @dataclass
@@ -105,6 +105,7 @@ def compute_null_space_projector_svd(
     rank_ratio: float = 0.95,
     min_null_dim: int = 10,
     regularization: float = 1e-4,
+    max_samples: int = 2000,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute null-space projector using SVD for numerical stability.
@@ -123,6 +124,7 @@ def compute_null_space_projector_svd(
         rank_ratio: Keep singular values explaining this fraction of variance
         min_null_dim: Minimum null space dimensions to preserve
         regularization: Added to singular values for stability
+        max_samples: Maximum samples to use (subsample if exceeded for speed)
 
     Returns:
         (V_truncated, singular_values) - low-rank factors for null-space projector
@@ -130,24 +132,93 @@ def compute_null_space_projector_svd(
     activations = activations.float()
     n_samples, hidden_dim = activations.shape
 
+    # Check for and handle non-finite values (NaN/Inf)
+    if not torch.isfinite(activations).all():
+        logger.warning("Non-finite values detected in activations, replacing with zeros")
+        activations = torch.nan_to_num(activations, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Filter out rows that are all zeros (can happen after nan_to_num)
+    row_norms = torch.norm(activations, dim=1)
+    valid_rows = row_norms > 1e-8
+    if valid_rows.sum() < n_samples:
+        logger.debug(f"Filtering {n_samples - valid_rows.sum().item()} zero/near-zero rows")
+        activations = activations[valid_rows]
+        n_samples = activations.shape[0]
+
+    if n_samples < 2:
+        logger.warning("Too few valid activation samples, returning minimal projector")
+        S = torch.ones(1, device=activations.device, dtype=activations.dtype)
+        V = torch.zeros(hidden_dim, 1, device=activations.device, dtype=activations.dtype)
+        V[0, 0] = 1.0
+        return V, S
+
+    # Subsample if too many samples (SVD is O(n*m^2), very slow for large n)
+    if n_samples > max_samples:
+        logger.debug(f"Subsampling {n_samples} activations to {max_samples} for SVD efficiency")
+        indices = torch.randperm(n_samples)[:max_samples]
+        activations = activations[indices]
+        n_samples = max_samples
+
     # Center activations for better numerical properties
     mean_act = activations.mean(dim=0, keepdim=True)
     centered = activations - mean_act
 
+    # Add small noise to break exact linear dependencies that cause SVD to fail
+    # This is a common technique for ill-conditioned matrices
+    centered = centered + 1e-6 * torch.randn_like(centered)
+
     # SVD of centered activations
+    # Use randomized SVD for efficiency (much faster than full SVD)
+    # Cap rank at 500 for speed - sufficient to capture preservation subspace
+    max_rank_for_randomized = min(n_samples, hidden_dim, 500)
+
     try:
-        U, S, Vh = torch.linalg.svd(centered, full_matrices=False)
-    except RuntimeError as e:
-        logger.warning(f"SVD failed, falling back to eigendecomposition: {e}")
-        # Fallback: eigendecomposition of K^T @ K
-        gram = centered.T @ centered
-        eigenvalues, V = torch.linalg.eigh(gram)
-        # Sort descending
-        idx = torch.argsort(eigenvalues, descending=True)
-        eigenvalues = eigenvalues[idx]
-        V = V[:, idx]
-        S = torch.sqrt(torch.clamp(eigenvalues, min=0))
+        # Always use randomized SVD - it's faster and sufficient for our purpose
+        # Full SVD is O(n*m^2) vs randomized O(n*k^2) where k << m
+        logger.debug(f"Computing randomized SVD for {n_samples} samples, rank={max_rank_for_randomized}")
+        U, S, V = torch.svd_lowrank(centered, q=max_rank_for_randomized, niter=2)
         Vh = V.T
+    except RuntimeError as e:
+        logger.warning(f"GPU randomized SVD failed, trying CPU randomized SVD: {e}")
+        # Fallback 1: Try randomized SVD on CPU (often more stable than GPU cusolver)
+        try:
+            centered_cpu = centered.cpu()
+            U, S, V = torch.svd_lowrank(centered_cpu, q=max_rank_for_randomized, niter=2)
+            S = S.to(activations.device)
+            Vh = V.T.to(activations.device)
+        except RuntimeError as e2:
+            logger.warning(f"CPU SVD failed, trying regularized eigendecomposition: {e2}")
+            # Fallback 2: eigendecomposition of K^T @ K with regularization
+            try:
+                gram = centered.T @ centered
+                # Add stronger Tikhonov regularization for numerical stability
+                # Use max of explicit regularization and data-adaptive regularization
+                trace_reg = regularization * torch.trace(gram) / hidden_dim
+                min_reg = 1e-6 * gram.abs().max()  # Scale with data magnitude
+                reg_value = max(trace_reg.item(), min_reg.item())
+                gram = gram + reg_value * torch.eye(hidden_dim, device=gram.device, dtype=gram.dtype)
+                eigenvalues, V = torch.linalg.eigh(gram)
+                # Sort descending
+                idx = torch.argsort(eigenvalues, descending=True)
+                eigenvalues = eigenvalues[idx]
+                V = V[:, idx]
+                S = torch.sqrt(torch.clamp(eigenvalues - reg_value, min=0))
+                Vh = V.T
+            except RuntimeError as e3:
+                logger.warning(f"Regularized eigendecomposition failed, trying randomized SVD: {e3}")
+                # Fallback 3: randomized SVD which is more numerically stable
+                try:
+                    # svd_lowrank is more robust for ill-conditioned matrices
+                    target_rank = min(n_samples, hidden_dim, 500)
+                    U, S, V = torch.svd_lowrank(centered, q=target_rank, niter=5)
+                    Vh = V.T
+                except RuntimeError as e4:
+                    logger.warning(f"Randomized SVD failed, using safe fallback: {e4}")
+                    # Fallback 4: Return minimal projector (effectively no null-space constraint)
+                    # This allows the computation to continue with degraded quality
+                    S = torch.ones(1, device=activations.device, dtype=activations.dtype)
+                    Vh = torch.zeros(1, hidden_dim, device=activations.device, dtype=activations.dtype)
+                    Vh[0, 0] = 1.0  # Arbitrary unit vector
 
     # Determine effective rank based on variance explained
     total_var = (S**2).sum()
@@ -236,7 +307,8 @@ def apply_null_space_constrained_projection(
     original_norm = weight.float().norm()
 
     weight_float = weight.float()
-    direction_float = F.normalize(direction.float(), dim=0)
+    # Ensure direction is on the same device and dtype as the weight
+    direction_float = F.normalize(direction.to(device=weight.device, dtype=torch.float32), dim=0)
 
     # Determine projection dimension
     if direction_float.shape[0] == weight_float.shape[1]:
@@ -313,31 +385,37 @@ class NullSpaceActivationExtractor:
         raise ValueError(f"Could not find layers in model: {type(self.model)}")
 
     def _create_hook(self, layer_idx: int):
-        """Create forward hook that captures ALL token activations."""
+        """Create forward hook that captures last-token activations."""
         def hook(module, input, output):
             if isinstance(output, tuple):
                 hidden_states = output[0]
             else:
                 hidden_states = output
 
-            # Store ALL token activations for null-space computation
-            # Flatten to [batch * seq_len, hidden_dim]
-            batch_size, seq_len, hidden_dim = hidden_states.shape
-            flat_acts = hidden_states.reshape(-1, hidden_dim)
+            # Check for NaN on EVERY batch (not just first)
+            if not torch.isfinite(hidden_states).all():
+                nan_count = (~torch.isfinite(hidden_states)).sum().item()
+                total = hidden_states.numel()
+                logger.warning(f"Layer {layer_idx}: MODEL OUTPUT HAS {nan_count}/{total} NaN values!")
+
+            # Use last token position (consistent with refusal direction extraction)
+            extracted = hidden_states[:, -1, :]
 
             if layer_idx not in self.activations:
                 self.activations[layer_idx] = []
-            self.activations[layer_idx].append(flat_acts.detach().cpu())
+            self.activations[layer_idx].append(extracted.detach().cpu())
 
         return hook
 
     def register_hooks(self, layer_indices: list[int]):
         """Register hooks on specified layers."""
         layers = self._get_layers()
+        logger.info(f"Registering null-space hooks on {len(layer_indices)} layers (indices: {min(layer_indices)}-{max(layer_indices)})")
         for idx in layer_indices:
             if 0 <= idx < len(layers):
                 hook = layers[idx].register_forward_hook(self._create_hook(idx))
                 self.hooks.append(hook)
+        logger.info(f"Successfully registered {len(self.hooks)} hooks")
 
     def remove_hooks(self):
         """Remove all hooks."""
@@ -359,10 +437,8 @@ class NullSpaceActivationExtractor:
         """
         Extract activations for preservation prompts.
 
-        Unlike refusal direction extraction which uses last token,
-        we extract ALL token activations to build a comprehensive
-        null space that preserves the model's behavior across the
-        full sequence.
+        Uses last token position (consistent with refusal direction extraction)
+        for numerical stability. One activation vector per prompt.
         """
         self.clear()
         self.model.eval()
@@ -390,13 +466,21 @@ class NullSpaceActivationExtractor:
                 max_length=max_length,
             ).to(self.device)
 
+            # Forward pass to trigger hooks
             _ = self.model(**inputs)
 
         # Concatenate activations per layer
         result = {}
         for layer_idx, acts in self.activations.items():
-            result[layer_idx] = torch.cat(acts, dim=0)
+            concatenated = torch.cat(acts, dim=0)
+            # Check for NaN after concatenation
+            if not torch.isfinite(concatenated).all():
+                nan_count = (~torch.isfinite(concatenated)).sum().item()
+                total = concatenated.numel()
+                logger.warning(f"Layer {layer_idx}: AFTER CONCAT has {nan_count}/{total} NaN values!")
+            result[layer_idx] = concatenated
 
+        logger.info(f"Extracted activations for {len(result)} layers, {len(acts)} batches each")
         return result
 
 
@@ -453,9 +537,15 @@ def compute_null_space_projectors(
 
     for layer_idx in tqdm(layer_indices, desc="Computing null-space projectors"):
         if layer_idx not in activations:
+            logger.warning(f"Layer {layer_idx}: NOT IN ACTIVATIONS!")
             continue
 
         acts = activations[layer_idx].to(device)
+        # Check for NaN after moving to device
+        if not torch.isfinite(acts).all():
+            nan_count = (~torch.isfinite(acts)).sum().item()
+            total = acts.numel()
+            logger.warning(f"Layer {layer_idx}: AFTER TO(DEVICE) has {nan_count}/{total} NaN values!")
         n_samples, hidden_dim = acts.shape
 
         logger.debug(f"Layer {layer_idx}: {n_samples} activation samples, dim {hidden_dim}")

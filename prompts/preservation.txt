@@ -2,7 +2,7 @@
 # These prompts capture activations for capabilities to preserve during abliteration
 # One prompt per line, lines starting with # are ignored
 
-# STEM - PHYSICS
+# STEM - PHYSICS (General)
 Explain Newton's three laws of motion with examples.
 What is the difference between kinetic and potential energy?
 How does electromagnetic induction work?
@@ -12,7 +12,33 @@ Describe wave-particle duality in quantum mechanics.
 How do black holes form and what are their properties?
 Explain the relationship between voltage, current, and resistance.
 
-# STEM - CHEMISTRY
+# STEM - PHYSICS (Advanced/College Level)
+Derive the equations of motion for a simple harmonic oscillator.
+Explain the Schrödinger equation and its significance in quantum mechanics.
+What is the Hamiltonian in classical mechanics?
+Describe the physics of electromagnetic waves and Maxwell's equations.
+Explain the principles of special relativity and time dilation.
+What is angular momentum conservation and how does it apply to planetary motion?
+Describe the physics of superconductivity.
+Explain the difference between bosons and fermions.
+What is the uncertainty principle and why is it fundamental?
+Describe nuclear fission and fusion processes.
+
+# STEM - ASTRONOMY
+What is the life cycle of a star from nebula to stellar remnant?
+Explain the Hertzsprung-Russell diagram and what it tells us about stars.
+What causes solar eclipses and lunar eclipses?
+Describe the structure of our solar system and the characteristics of each planet.
+What is a neutron star and how does it form?
+Explain the evidence for the Big Bang theory.
+What is dark matter and why do scientists believe it exists?
+Describe the different types of galaxies and their structures.
+What are exoplanets and how are they detected?
+Explain the concept of redshift and how it relates to the expansion of the universe.
+What is the Chandrasekhar limit and why is it important?
+Describe the seasons on different planets in our solar system.
+
+# STEM - CHEMISTRY (General)
 Explain the difference between ionic and covalent bonds.
 What is electronegativity and how does it affect bonding?
 Describe the process of titration in analytical chemistry.
@@ -21,6 +47,20 @@ Explain Le Chatelier's principle with an example.
 How do catalysts speed up chemical reactions?
 What is the difference between organic and inorganic chemistry?
 Describe the structure and properties of benzene.
+
+# STEM - CHEMISTRY (Advanced/College Level)
+Explain molecular orbital theory and bonding/antibonding orbitals.
+What is hybridization in organic chemistry (sp, sp2, sp3)?
+Describe the Arrhenius equation and activation energy.
+What is stereochemistry and why is chirality important?
+Explain buffer solutions and the Henderson-Hasselbalch equation.
+What are thermodynamic versus kinetic control in reactions?
+Describe the Born-Haber cycle for ionic compounds.
+What is the Nernst equation and how does it relate to electrochemistry?
+Explain coordination chemistry and ligand field theory.
+What are the mechanisms of SN1 and SN2 reactions?
+Describe crystalline structures and unit cells.
+What is spectroscopy and how is it used to identify compounds?
 
 # STEM - BIOLOGY & MEDICINE
 Explain how photosynthesis works.
@@ -34,7 +74,7 @@ What are viruses and how do they differ from bacteria?
 Explain antibiotic resistance and why it's a concern.
 What is CRISPR and how does it edit genes?
 
-# STEM - MATHEMATICS
+# STEM - MATHEMATICS (General)
 Solve the equation 2x + 5 = 15.
 What is the Pythagorean theorem?
 Explain probability using a coin flip example.
@@ -45,6 +85,34 @@ What is the fundamental theorem of algebra?
 How do you solve a system of linear equations?
 Explain the concept of mathematical proof by induction.
 What is the difference between permutations and combinations?
+
+# STEM - MATHEMATICS (Statistics)
+Explain the central limit theorem and its importance in statistics.
+What is the difference between population and sample in statistics?
+How do you calculate standard deviation and what does it measure?
+Explain hypothesis testing and the concept of p-values.
+What is a confidence interval and how do you interpret it?
+Describe the difference between Type I and Type II errors.
+What is regression analysis and when would you use it?
+Explain the chi-square test and its applications.
+What is the difference between correlation and causation in statistical analysis?
+Describe the normal distribution and its properties.
+What is Bayesian inference and how does it differ from frequentist statistics?
+Explain analysis of variance (ANOVA) and when to use it.
+
+# STEM - MATHEMATICS (Abstract Algebra)
+What is a group in abstract algebra and what are its properties?
+Explain the concept of a ring and give examples.
+What is a field in algebra and how does it differ from a ring?
+Describe the symmetric group and permutation groups.
+What is an isomorphism between algebraic structures?
+Explain the concept of a subgroup and normal subgroups.
+What is Lagrange's theorem in group theory?
+Describe vector spaces and their key properties.
+What is a homomorphism in abstract algebra?
+Explain the concept of quotient groups.
+What are cyclic groups and how are they generated?
+Describe the fundamental theorem of finite abelian groups.
 
 # STEM - COMPUTER SCIENCE
 Write a Python function to calculate factorial.
@@ -94,7 +162,7 @@ What is the separation of powers in government?
 Describe different types of electoral systems.
 What is globalization and its effects on society?
 
-# LAW & ETHICS
+# LAW & ETHICS (General)
 What is the difference between civil and criminal law?
 Explain the concept of jurisdiction in legal systems.
 What are human rights according to international law?
@@ -105,6 +173,52 @@ What is the difference between ethics and morality?
 Describe utilitarianism as an ethical framework.
 What is corporate social responsibility?
 Explain the concept of due process.
+
+# LAW - JURISPRUDENCE (Legal Philosophy)
+What is natural law theory in jurisprudence?
+Explain legal positivism and its main proponents.
+What is the relationship between law and morality according to H.L.A. Hart?
+Describe Ronald Dworkin's theory of law as integrity.
+What is legal realism and how does it view judicial decision-making?
+Explain the concept of legal rights versus moral rights.
+What is the rule of law and why is it important?
+Describe the difference between procedural and substantive justice.
+What is originalism in constitutional interpretation?
+Explain the concept of stare decisis and precedent in common law.
+What are the theories of punishment in criminal law (retributive, utilitarian, rehabilitative)?
+Describe the concept of legal reasoning and how judges apply laws to cases.
+
+# ETHICS - MORAL SCENARIOS
+In the trolley problem, a runaway trolley will kill five people. You can pull a lever to divert it to a side track where it will kill one person. What are the ethical considerations?
+A doctor has five patients who will die without organ transplants. A healthy patient comes in for a checkup. Would it be ethical to harvest the healthy patient's organs to save the five?
+You witness a friend cheating on an exam. Should you report them? What factors would you consider?
+A pharmaceutical company can save thousands of lives with a new drug but must price it high to recoup R&D costs. How should they balance profit and access?
+Is it ethical to lie to protect someone's feelings, or is honesty always the best policy?
+A self-driving car must choose between hitting a group of pedestrians or swerving and killing its passenger. How should it be programmed?
+You find a wallet with $500 and the owner's ID. What is the morally right thing to do?
+A journalist discovers information that could damage a politician but would also expose corruption. Should they publish it?
+Is it ethical to eat meat? What are the arguments on both sides?
+A company discovers their product has a small defect that could harm 1 in 100,000 users. Should they recall all products or just issue a warning?
+You can save either your mother or a brilliant scientist who will cure cancer. Who do you save and why?
+Is civil disobedience ever morally justified? Under what circumstances?
+
+# PROFESSIONAL ACCOUNTING
+What are the basic accounting equation and its components?
+Explain the difference between cash basis and accrual basis accounting.
+What are the main financial statements and what does each show?
+Describe the concept of double-entry bookkeeping.
+What is depreciation and what methods are used to calculate it?
+Explain the difference between assets, liabilities, and equity.
+What is the purpose of an audit and what does an auditor do?
+Describe Generally Accepted Accounting Principles (GAAP).
+What is the difference between revenue and profit?
+Explain accounts receivable and accounts payable.
+What is a balance sheet and how do you read one?
+Describe the income statement and its key components.
+What is working capital and why is it important?
+Explain the concept of amortization versus depreciation.
+What are internal controls in accounting and why are they important?
+Describe the difference between managerial and financial accounting.
 
 # HISTORY & GEOGRAPHY
 Analyze the causes of World War I.
@@ -120,6 +234,24 @@ Explain the significance of the Silk Road in history.
 What were the causes and effects of the Protestant Reformation?
 Describe the main events of the Russian Revolution.
 
+# GLOBAL FACTS & WORLD KNOWLEDGE
+What are the most populous countries in the world?
+Which countries are permanent members of the UN Security Council?
+What is the European Union and which countries are members?
+What are the world's major religions ranked by number of followers?
+Which countries share a border with China?
+What is the longest river in the world?
+What are the Seven Wonders of the Ancient World?
+Which country has the largest economy by GDP?
+What are the official languages of Switzerland?
+What is the highest mountain in Africa?
+Which ocean is the largest by surface area?
+What are the BRICS nations?
+What is the currency used in Japan?
+Which country has won the most FIFA World Cup titles?
+What is the smallest country in the world by area?
+What are the major exports of Saudi Arabia?
+
 # HUMANITIES - PHILOSOPHY & RELIGION
 Who wrote Romeo and Juliet?
 Explain Plato's Allegory of the Cave.
@@ -131,6 +263,23 @@ What are the five pillars of Islam?
 Describe the Socratic method of inquiry.
 What is the problem of evil in philosophy of religion?
 Explain the concept of karma in Hinduism.
+
+# HUMANITIES - PHILOSOPHY (Extended)
+What is the mind-body problem in philosophy of mind?
+Explain Descartes' cogito ergo sum and its significance.
+What is determinism versus free will?
+Describe John Rawls' theory of justice and the veil of ignorance.
+What is phenomenology and who founded it?
+Explain the difference between a priori and a posteriori knowledge.
+What is the ship of Theseus paradox about identity?
+Describe Nietzsche's concept of the Übermensch.
+What is the difference between deontological and consequentialist ethics?
+Explain Aristotle's virtue ethics.
+What is the is-ought problem (Hume's guillotine)?
+Describe pragmatism as a philosophical tradition.
+What is solipsism and why is it considered a problem?
+Explain the trolley problem and its variations.
+What is the Turing test and its implications for philosophy of mind?
 
 # HUMANITIES - LANGUAGE & LITERATURE
 What are the major themes in Shakespeare's Hamlet?
