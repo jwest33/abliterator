@@ -367,7 +367,7 @@ def display_banner():
 
     # Subtitle
     subtitle = Text()
-    subtitle.append("Orthogonal Projection Abliteration with Norm-Preservation, Null-Space Constaints, Winsorization, and Adaptive Layer Weighting", style=f"bold {THEME['muted']}")
+    subtitle.append("Language Model Abliteration", style=f"bold {THEME['muted']}")
     console.print(Align.center(subtitle))
     console.print()
 

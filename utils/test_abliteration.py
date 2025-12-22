@@ -26,6 +26,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.abliterate import get_default_prompts_path
 from src.model_utils import load_model_and_tokenizer
+from utils.refusal_detector import LogLikelihoodRefusalDetector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -551,19 +552,20 @@ def compare_models(
 
     logger.info(f"Loading original model from {original_path}")
     orig_model, orig_tokenizer = load_model(original_path, device)
+    orig_detector = LogLikelihoodRefusalDetector(orig_model, orig_tokenizer)
 
     logger.info(f"Loading abliterated model from {abliterated_path}")
     abl_model, abl_tokenizer = load_model(abliterated_path, device)
+    abl_detector = LogLikelihoodRefusalDetector(abl_model, abl_tokenizer)
 
     for prompt in test_prompts:
         logger.info(f"\nPrompt: {prompt}")
         logger.info("-" * 50)
 
+        orig_refused = orig_detector.detect_refusal(prompt)
+        abl_refused = abl_detector.detect_refusal(prompt)
         orig_response = generate_response(orig_model, orig_tokenizer, prompt, max_new_tokens)
         abl_response = generate_response(abl_model, abl_tokenizer, prompt, max_new_tokens)
-
-        orig_refused = detect_refusal(orig_response)
-        abl_refused = detect_refusal(abl_response)
 
         result = {
             "prompt": prompt,
@@ -604,14 +606,15 @@ def test_single_model(
     """Test a single model's responses."""
     logger.info(f"Loading model from {model_path}")
     model, tokenizer = load_model(model_path, device)
+    detector = LogLikelihoodRefusalDetector(model, tokenizer)
 
     results = []
     for prompt in test_prompts:
         logger.info(f"\nPrompt: {prompt}")
         logger.info("-" * 50)
 
+        refused = detector.detect_refusal(prompt)
         response = generate_response(model, tokenizer, prompt, max_new_tokens)
-        refused = detect_refusal(response)
 
         result = {
             "prompt": prompt,
@@ -671,13 +674,29 @@ def evaluate_prompts_batched(
     max_new_tokens: int,
     temperature: float,
     desc: str = "Evaluating",
+    refusal_detector: "LogLikelihoodRefusalDetector | None" = None,
 ) -> list[dict]:
-    """Evaluate prompts in batches and return results with refusal detection."""
+    """
+    Evaluate prompts in batches and return results with refusal detection.
+
+    Args:
+        refusal_detector: If provided, uses log-likelihood detection to predict
+            refusals BEFORE generation. If None, falls back to heuristic
+            detection on generated responses.
+    """
     results = []
+
+    # If using log-likelihood detector, predict all refusals upfront
+    if refusal_detector is not None:
+        logger.info("Using log-likelihood refusal detection (prediction before generation)")
+        all_refusals = refusal_detector.detect_refusal_batch(prompts)
+    else:
+        all_refusals = None
 
     # Process in batches with progress bar
     for i in tqdm(range(0, len(prompts), batch_size), desc=desc, unit="batch"):
         batch_prompts = prompts[i:i + batch_size]
+        batch_refusals = all_refusals[i:i + batch_size] if all_refusals else None
 
         try:
             responses = generate_batch(
@@ -695,8 +714,12 @@ def evaluate_prompts_batched(
             else:
                 raise
 
-        for prompt, response in zip(batch_prompts, responses):
-            refused = detect_refusal(response)
+        for j, (prompt, response) in enumerate(zip(batch_prompts, responses)):
+            if batch_refusals is not None:
+                refused = batch_refusals[j]
+            else:
+                # Fallback to heuristic detection
+                refused = detect_refusal(response)
             results.append({
                 "prompt": prompt,
                 "response": response,
@@ -746,6 +769,10 @@ def eval_refusal_rates(
     model, tokenizer = load_model(model_path, device)
     model_info = get_model_info(model)
 
+    # Create log-likelihood refusal detector
+    logger.info("Creating log-likelihood refusal detector")
+    refusal_detector = LogLikelihoodRefusalDetector(model, tokenizer)
+
     # Auto-detect batch size if not specified
     if batch_size is None:
         all_samples = harmful_sample + harmless_sample
@@ -761,14 +788,16 @@ def eval_refusal_rates(
     logger.info("Evaluating harmful prompts...")
     harmful_results = evaluate_prompts_batched(
         model, tokenizer, harmful_sample, batch_size,
-        max_new_tokens, temperature, desc="Harmful prompts"
+        max_new_tokens, temperature, desc="Harmful prompts",
+        refusal_detector=refusal_detector,
     )
 
     # Evaluate harmless prompts (we DON'T want refusals here)
     logger.info("Evaluating harmless prompts...")
     harmless_results = evaluate_prompts_batched(
         model, tokenizer, harmless_sample, batch_size,
-        max_new_tokens, temperature, desc="Harmless prompts"
+        max_new_tokens, temperature, desc="Harmless prompts",
+        refusal_detector=refusal_detector,
     )
 
     end_time = time.perf_counter()

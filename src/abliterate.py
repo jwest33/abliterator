@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import gc
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.model_utils import load_model_and_tokenizer
 from src.cli_components import get_versioned_path, get_prompts_path
+from utils.refusal_detector import LogLikelihoodRefusalDetector, RefusalDetectorConfig
 
 # Configure logging
 logging.basicConfig(
@@ -190,8 +192,9 @@ class AbliterationConfig:
     max_new_tokens: int = 1  # We only need the first forward pass
     token_position: str = "last"  # Which token position to extract: "last", "mean", or int
     filter_harmful_prompts: bool = True  # Filter out harmful prompts that aren't actually refused
-    refusal_test_max_tokens: int = 50  # Max tokens to generate when testing for refusal
+    refusal_test_max_tokens: int = 50  # Max tokens to generate when testing for refusal (legacy)
     refusal_test_batch_size: int = 16  # Batch size for refusal testing (larger = faster but more VRAM)
+    refusal_threshold: float = -7.0  # Log-likelihood threshold for refusal detection (higher = more likely to refuse)
     refusal_keywords: list[str] = field(default_factory=lambda: [
         "I cannot", "I can't", "I'm not able", "I am not able",
         "I won't", "I will not", "I'm unable", "I am unable",
@@ -1736,8 +1739,8 @@ def filter_harmful_prompts_by_refusal(
 ) -> tuple[list[str], list[str]]:
     """
     Filter harmful prompts to only include those that the model actually refuses.
-    Uses batched generation for speed and samples additional prompts if needed
-    to reach the target count.
+    Uses log-likelihood based detection for fast, accurate refusal prediction
+    without generating responses.
 
     Args:
         prompt_pool: Full pool of available harmful prompts to sample from
@@ -1754,6 +1757,10 @@ def filter_harmful_prompts_by_refusal(
 
     logger.info(f"Finding {target_count} refused prompts from pool of {len(prompt_pool)}...")
 
+    # Create log-likelihood based refusal detector
+    detector_config = RefusalDetectorConfig(threshold=config.refusal_threshold)
+    detector = LogLikelihoodRefusalDetector(model, tokenizer, detector_config)
+
     refused_prompts = []
     non_refused_prompts = []
     tested_count = 0
@@ -1762,30 +1769,32 @@ def filter_harmful_prompts_by_refusal(
     shuffled_prompts = prompt_pool.copy()
     random.shuffle(shuffled_prompts)
 
-    # Process all prompts in batches until we have enough refusals
+    # Process in batches until we have enough refusals
     batch_size = config.refusal_test_batch_size
-    total_batches = (len(shuffled_prompts) + batch_size - 1) // batch_size
 
-    with tqdm(total=total_batches, desc="Finding refused prompts", unit="batch") as pbar:
+    # Progress bar tracks found refusals vs target
+    with tqdm(total=target_count, desc="Finding refused prompts", unit="prompt") as pbar:
         for i in range(0, len(shuffled_prompts), batch_size):
             if len(refused_prompts) >= target_count:
                 break
 
             batch_prompts = shuffled_prompts[i : i + batch_size]
-            batch_results = test_prompts_for_refusal_batch(batch_prompts, model, tokenizer, config)
 
-            for prompt, is_refused, response in batch_results:
+            # Use log-likelihood detection (no generation needed)
+            batch_results = detector.detect_refusal_with_scores(batch_prompts)
+
+            for prompt, (is_refused, score) in zip(batch_prompts, batch_results):
                 tested_count += 1
                 if is_refused:
                     refused_prompts.append(prompt)
-                    logger.debug(f"REFUSED: {prompt[:50]}...")
+                    logger.debug(f"REFUSED (score={score:.2f}): {prompt[:50]}...")
+                    # Update progress bar for each refusal found
+                    pbar.update(1)
+                    if len(refused_prompts) >= target_count:
+                        break
                 else:
                     non_refused_prompts.append(prompt)
-                    logger.debug(f"NOT REFUSED: {prompt[:50]}... -> {response[:100]}...")
-
-            # Update progress bar with batch count and show refusals found
-            pbar.update(1)
-            pbar.set_postfix({"found": f"{len(refused_prompts)}/{target_count}"})
+                    logger.debug(f"NOT REFUSED (score={score:.2f}): {prompt[:50]}...")
 
     logger.info(f"Refusal filtering complete:")
     logger.info(f"  - Prompts tested: {tested_count}")
@@ -1974,8 +1983,8 @@ def run_abliteration(config: AbliterationConfig):
         "num_harmful_prompts": len(config.harmful_prompts),
         "num_harmless_prompts": len(config.harmless_prompts),
         "filter_harmful_prompts": config.filter_harmful_prompts,
-        "refusal_test_max_tokens": config.refusal_test_max_tokens,
         "refusal_test_batch_size": config.refusal_test_batch_size,
+        "refusal_threshold": config.refusal_threshold,
         # Winsorization options
         "use_winsorization": config.use_winsorization,
         "winsorize_percentile": config.winsorize_percentile if config.use_winsorization else None,
@@ -2148,6 +2157,12 @@ Examples:
         help="Batch size for refusal testing (larger = faster, but more VRAM). Default: 16",
     )
     parser.add_argument(
+        "--refusal_threshold",
+        type=float,
+        default=-7.0,
+        help="Log-likelihood threshold for refusal detection (higher = stricter). Default: -7.0",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -2201,12 +2216,21 @@ Examples:
         load_directions_path=args.load_directions,
         batch_size=args.batch_size,
         refusal_test_batch_size=args.refusal_test_batch_size,
+        refusal_threshold=args.refusal_threshold,
         token_position=token_pos,
         filter_harmful_prompts=not args.no_filter_prompts,
         refusal_test_max_tokens=args.refusal_test_tokens,
     )
 
-    run_abliteration(config)
+    model, tokenizer = run_abliteration(config)
+
+    # Unload model from memory
+    del model
+    del tokenizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Model unloaded from memory")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ A modern terminal interface for removing refusal behavior from language models.
 Supports interactive mode (default) and batch mode for automation.
 """
 
+import gc
 import json
 import sys
 from datetime import datetime
@@ -590,6 +591,14 @@ def run_abliteration(config: dict) -> bool:
 
             progress.advance(task, 10)
 
+            # Unload model from memory
+            progress.update(task, description="Cleaning up...")
+            del model
+            del tokenizer
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
         display_success(f"Model abliterated successfully!\n\nOutput saved to: {output_path}")
         return True
 
@@ -645,14 +654,16 @@ def run_test_model():
         ).ask()
 
         if prompt:
-            from utils.test_abliteration import load_model, generate_response, detect_refusal
+            from utils.test_abliteration import load_model, generate_response
+            from utils.refusal_detector import LogLikelihoodRefusalDetector
 
             with console.status("Loading model..."):
                 model, tokenizer = load_model(model_path)
+                detector = LogLikelihoodRefusalDetector(model, tokenizer)
 
-            with console.status("Generating response..."):
+            with console.status("Detecting refusal and generating response..."):
+                refused = detector.detect_refusal(prompt)
                 response = generate_response(model, tokenizer, prompt)
-                refused = detect_refusal(response)
 
             from rich.panel import Panel
             status = "[red]REFUSED[/red]" if refused else "[green]OK[/green]"
@@ -878,26 +889,29 @@ def run_compare_models():
     if not prompt:
         return
 
-    from utils.test_abliteration import load_model, generate_response, detect_refusal
+    from utils.test_abliteration import load_model, generate_response
+    from utils.refusal_detector import LogLikelihoodRefusalDetector
 
     with console.status("Loading original model..."):
         orig_model, orig_tokenizer = load_model(original_path)
+        orig_detector = LogLikelihoodRefusalDetector(orig_model, orig_tokenizer)
 
-    with console.status("Generating original response..."):
+    with console.status("Detecting refusal and generating original response..."):
+        orig_refused = orig_detector.detect_refusal(prompt)
         orig_response = generate_response(orig_model, orig_tokenizer, prompt)
-        orig_refused = detect_refusal(orig_response)
 
     # Clear original model to free memory
-    del orig_model
+    del orig_model, orig_detector
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     with console.status("Loading abliterated model..."):
         abl_model, abl_tokenizer = load_model(abliterated_path)
+        abl_detector = LogLikelihoodRefusalDetector(abl_model, abl_tokenizer)
 
-    with console.status("Generating abliterated response..."):
+    with console.status("Detecting refusal and generating abliterated response..."):
+        abl_refused = abl_detector.detect_refusal(prompt)
         abl_response = generate_response(abl_model, abl_tokenizer, prompt)
-        abl_refused = detect_refusal(abl_response)
 
     console.print()
     display_comparison_panel(
@@ -909,6 +923,11 @@ def run_compare_models():
         orig_refused,
         abl_refused,
     )
+
+    # Clean up abliterated model
+    del abl_model, abl_detector
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def run_gguf_export():
