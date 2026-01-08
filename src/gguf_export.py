@@ -426,6 +426,8 @@ def convert_hf_to_gguf(
             cmd,
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             check=False,
         )
 
@@ -490,6 +492,8 @@ def quantize_gguf(
             cmd,
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             check=False,
         )
 
@@ -547,6 +551,8 @@ def convert_vision_encoder(
             cmd,
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             check=False,
         )
 

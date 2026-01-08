@@ -10,3 +10,6 @@ venv/*
 lm-evaluation-harness/
 eval_abliterated/*
 abliteration.egg-info
+eval_refusal/
+eval_test/
+lab/

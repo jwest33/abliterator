@@ -382,6 +382,14 @@ class NullSpaceActivationExtractor:
                 return self.model.transformer.layers
         if hasattr(self.model, "gpt_neox") and hasattr(self.model.gpt_neox, "layers"):
             return self.model.gpt_neox.layers
+        # GptOss and similar: may have backbone or encoder wrapper
+        if hasattr(self.model, "backbone") and hasattr(self.model.backbone, "layers"):
+            return self.model.backbone.layers
+        if hasattr(self.model, "encoder") and hasattr(self.model.encoder, "layers"):
+            return self.model.encoder.layers
+        # Models with layers directly on the wrapper (no inner model)
+        if hasattr(self.model, "layers"):
+            return self.model.layers
         raise ValueError(f"Could not find layers in model: {type(self.model)}")
 
     def _create_hook(self, layer_idx: int):

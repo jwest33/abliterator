@@ -29,10 +29,13 @@ dependencies = [
     "rich>=13.0.0",
     "questionary>=2.0.0",
     "click>=8.0.0",
+    "huggingface_hub>=0.20.0",
+    "safetensors>=0.4.0",
 ]
 
 [project.scripts]
 abliterate = "src.cli:cli"
+feature-surgery = "src.feature_surgery_cli:main"
 
 [project.optional-dependencies]
 dev = [

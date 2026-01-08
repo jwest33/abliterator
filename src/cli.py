@@ -8,7 +8,19 @@ Supports interactive mode (default) and batch mode for automation.
 
 import gc
 import json
+import os
 import sys
+
+# Fix Windows encoding issues with tokenizer files
+# Must be set before any file I/O operations
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONUTF8", "1")
+    # Also try to set console output encoding
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, OSError):
+        pass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -321,12 +333,64 @@ def get_abliteration_config() -> Optional[dict]:
                 style=custom_style,
             ).ask())
 
-        # Adaptive layer weighting
-        config["use_adaptive_weighting"] = questionary.confirm(
-            "Enable adaptive layer weighting?",
-            default=False,
+        # Layer targeting options
+        console.print(f"\n[bold {THEME['secondary']}]Layer Targeting[/bold {THEME['secondary']}]")
+
+        layer_targeting_choice = questionary.select(
+            "How would you like to control per-layer ablation strength?",
+            choices=[
+                questionary.Choice("None (uniform across layers)", value="none"),
+                questionary.Choice("Simple adaptive weighting (Gaussian)", value="adaptive"),
+                questionary.Choice("Layer target map (JSON file)", value="target_map"),
+            ],
             style=custom_style,
         ).ask()
+
+        config["layer_targeting_mode"] = layer_targeting_choice
+        config["use_adaptive_weighting"] = False
+        config["layer_target_map_path"] = None
+        config["per_layer_multipliers"] = None
+        config["exclude_layers"] = None
+        config["unmapped_layer_behavior"] = "skip"
+
+        if layer_targeting_choice == "adaptive":
+            config["use_adaptive_weighting"] = True
+
+        elif layer_targeting_choice == "target_map":
+            config["layer_target_map_path"] = questionary.path(
+                "Path to layer_target_map.json:",
+                style=custom_style,
+            ).ask()
+
+            if config["layer_target_map_path"]:
+                # Load and validate the target map
+                from src.abliterate import load_layer_target_map
+                try:
+                    target_map = load_layer_target_map(config["layer_target_map_path"])
+
+                    # Show summary to user
+                    console.print(f"\n[{THEME['success']}]Loaded target map:[/{THEME['success']}]")
+                    console.print(f"  - Target layers: {len(target_map.get('target_layer_indices', []))}")
+                    console.print(f"  - Excluded layers: {len(target_map.get('exclude_layers', []))}")
+                    console.print(f"  - Aggressive layers: {len(target_map['metadata'].get('aggressive_layers', []))}")
+                    console.print(f"  - Protected layers: {len(target_map['metadata'].get('protected_layers', []))}")
+
+                    config["per_layer_multipliers"] = target_map["per_layer_multipliers"]
+                    config["exclude_layers"] = target_map.get("exclude_layers", [])
+
+                    # Ask about unmapped layer behavior
+                    config["unmapped_layer_behavior"] = questionary.select(
+                        "How should layers NOT in the target map be handled?",
+                        choices=[
+                            questionary.Choice("Skip ablation (safest)", value="skip"),
+                            questionary.Choice("Apply default multiplier (1.0)", value="default"),
+                        ],
+                        style=custom_style,
+                    ).ask()
+
+                except Exception as e:
+                    display_error(f"Failed to load target map: {e}")
+                    return None
 
         # Biprojection options
         console.print(f"\n[bold {THEME['secondary']}]Biprojection (improved NatInt preservation)[/bold {THEME['secondary']}]")
@@ -496,6 +560,12 @@ def run_abliteration(config: dict) -> bool:
                 harmless_clamp_ratio=config.get("harmless_clamp_ratio", 0.1),
                 num_measurement_layers=config.get("num_measurement_layers", 2),
                 intervention_range=config.get("intervention_range", (0.25, 0.95)),
+                # Layer target map options
+                layer_targeting_mode=config.get("layer_targeting_mode", "none"),
+                layer_target_map_path=config.get("layer_target_map_path"),
+                per_layer_multipliers=config.get("per_layer_multipliers"),
+                exclude_layers=config.get("exclude_layers"),
+                unmapped_layer_behavior=config.get("unmapped_layer_behavior", "skip"),
             )
 
             # Filter prompts if enabled
@@ -2400,12 +2470,15 @@ def main_menu():
 @click.option("--num-measurement-layers", type=int, default=2, help="Number of high-quality layers for biprojection")
 @click.option("--intervention-start", type=float, default=0.25, help="Intervention range start (0.0-1.0)")
 @click.option("--intervention-end", type=float, default=0.95, help="Intervention range end (0.0-1.0)")
+@click.option("--layer-target-map", type=str, default=None, help="Path to layer_target_map.json for data-driven layer targeting")
+@click.option("--unmapped-layer-behavior", type=click.Choice(["skip", "default"]), default="skip", help="How to handle layers not in target map")
 def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
         no_norm_preservation, no_filter_prompts, device, dtype,
         winsorize, winsorize_percentile, null_space, preservation_prompts,
         null_space_rank_ratio, adaptive_weighting,
         projected, biprojection, per_neuron_norm, target_layers, harmless_boundary,
-        harmless_clamp_ratio, num_measurement_layers, intervention_start, intervention_end):
+        harmless_clamp_ratio, num_measurement_layers, intervention_start, intervention_end,
+        layer_target_map, unmapped_layer_behavior):
     """
     Abliteration Toolkit - Remove refusal behavior from language models.
 
@@ -2449,6 +2522,29 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
         if target_layers:
             parsed_target_layers = [t.strip() for t in target_layers.split(",")]
 
+        # Load layer target map if provided
+        per_layer_multipliers = None
+        exclude_layers = None
+        layer_targeting_mode = "none"
+
+        if layer_target_map:
+            from src.abliterate import load_layer_target_map
+            try:
+                target_map_data = load_layer_target_map(layer_target_map)
+                per_layer_multipliers = target_map_data["per_layer_multipliers"]
+                exclude_layers = target_map_data.get("exclude_layers", [])
+                layer_targeting_mode = "target_map"
+
+                # Layer target map overrides adaptive weighting
+                if adaptive_weighting:
+                    console.print(f"[{THEME['warning']}]Warning: --layer-target-map overrides --adaptive-weighting[/{THEME['warning']}]")
+
+            except Exception as e:
+                console.print(f"[red]Error loading layer target map: {e}[/red]")
+                sys.exit(1)
+        elif adaptive_weighting:
+            layer_targeting_mode = "adaptive"
+
         config = {
             "model_path": model_path,
             "output_path": effective_output_path,
@@ -2464,7 +2560,7 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
             "use_null_space": null_space,
             "preservation_prompts_path": preservation_prompts,
             "null_space_rank_ratio": null_space_rank_ratio,
-            "use_adaptive_weighting": adaptive_weighting,
+            "use_adaptive_weighting": adaptive_weighting and not layer_target_map,  # Disabled if target map provided
             # Projected abliteration (orthogonalize against harmless)
             "use_projected_refusal": projected,
             # Biprojection options
@@ -2475,6 +2571,12 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
             "harmless_clamp_ratio": harmless_clamp_ratio,
             "num_measurement_layers": num_measurement_layers,
             "intervention_range": (intervention_start, intervention_end),
+            # Layer target map options
+            "layer_targeting_mode": layer_targeting_mode,
+            "layer_target_map_path": layer_target_map,
+            "per_layer_multipliers": per_layer_multipliers,
+            "exclude_layers": exclude_layers,
+            "unmapped_layer_behavior": unmapped_layer_behavior,
         }
 
         display_banner()

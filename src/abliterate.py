@@ -253,6 +253,16 @@ class AbliterationConfig:
     use_quality_selection: bool = False  # Use SNR-based layer quality scoring
     min_quality_threshold: float = 0.0  # Skip layers below this quality score
 
+    # Layer target map integration (data-driven per-layer weighting)
+    layer_target_map_path: Optional[str] = None  # Path to layer_target_map.json
+    per_layer_multipliers: Optional[dict[int, float]] = None  # Direct multipliers per layer
+    exclude_layers: Optional[list[int]] = None  # Layers to skip entirely
+    layer_targeting_mode: str = "none"  # "none", "adaptive", "target_map"
+
+    # Unmapped layer behavior (when using target map)
+    unmapped_layer_behavior: str = "skip"  # "skip" or "default"
+    unmapped_layer_multiplier: float = 1.0  # Multiplier for layers not in map (when behavior="default")
+
 
 @dataclass
 class RefusalDirections:
@@ -326,10 +336,13 @@ class ActivationExtractor:
                 return self.model.model.layers
             elif hasattr(self.model.model, "decoder") and hasattr(self.model.model.decoder, "layers"):
                 return self.model.model.decoder.layers
-        # VL models with language_model attribute (some LLaVA variants, InternVL, etc.)
+        # VL models with language_model attribute (some LLaVA variants, InternVL, GLM4v, etc.)
         if hasattr(self.model, "language_model"):
             if hasattr(self.model.language_model, "model") and hasattr(self.model.language_model.model, "layers"):
                 return self.model.language_model.model.layers
+            # GLM4v and similar: language_model.transformer.layers
+            if hasattr(self.model.language_model, "transformer") and hasattr(self.model.language_model.transformer, "layers"):
+                return self.model.language_model.transformer.layers
             if hasattr(self.model.language_model, "layers"):
                 return self.model.language_model.layers
         if hasattr(self.model, "transformer"):
@@ -339,6 +352,14 @@ class ActivationExtractor:
                 return self.model.transformer.layers
         if hasattr(self.model, "gpt_neox") and hasattr(self.model.gpt_neox, "layers"):
             return self.model.gpt_neox.layers
+        # GptOss and similar: may have backbone or encoder wrapper
+        if hasattr(self.model, "backbone") and hasattr(self.model.backbone, "layers"):
+            return self.model.backbone.layers
+        if hasattr(self.model, "encoder") and hasattr(self.model.encoder, "layers"):
+            return self.model.encoder.layers
+        # Models with layers directly on the wrapper (no inner model)
+        if hasattr(self.model, "layers"):
+            return self.model.layers
 
         # Debug: print model structure to help identify the correct path
         structure_info = self._get_model_structure_info()
@@ -543,6 +564,139 @@ def compute_adaptive_layer_weights(
         weights = {k: v / max_weight for k, v in weights.items()}
 
     return weights
+
+
+# Layer Target Map Loading and Validation
+
+
+def load_layer_target_map(path: str) -> dict:
+    """
+    Load and parse a layer target map from a JSON file.
+
+    The layer target map provides data-driven per-layer abliteration weights
+    based on feature distribution analysis. It identifies which layers to
+    target aggressively, protect, or exclude entirely.
+
+    Args:
+        path: Path to the layer_target_map.json file
+
+    Returns:
+        Dictionary containing:
+            - per_layer_multipliers: {int: float} mapping layer index to multiplier
+            - exclude_layers: list[int] of layers to skip
+            - target_layer_indices: list[int] of layers to abliterate
+            - recommended_center_ratio: float for Gaussian fallback
+            - recommended_sigma_ratio: float for Gaussian fallback
+            - metadata: dict with layer_stats, aggressive_layers, protected_layers
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        raw_config = json.load(f)
+
+    # Convert string keys to int for layer_multipliers
+    per_layer_multipliers = {}
+    if "layer_multipliers" in raw_config:
+        per_layer_multipliers = {
+            int(k): float(v) for k, v in raw_config["layer_multipliers"].items()
+        }
+    elif "abliteration_config" in raw_config and "per_layer_multipliers" in raw_config["abliteration_config"]:
+        per_layer_multipliers = {
+            int(k): float(v) for k, v in raw_config["abliteration_config"]["per_layer_multipliers"].items()
+        }
+
+    # Extract exclude_layers
+    exclude_layers = raw_config.get("excluded_layers", [])
+    if not exclude_layers and "abliteration_config" in raw_config:
+        exclude_layers = raw_config["abliteration_config"].get("exclude_layers", [])
+
+    # Extract target layer indices
+    target_layer_indices = raw_config.get("target_layer_indices", [])
+
+    # Extract Gaussian parameters for fallback
+    recommended_center_ratio = raw_config.get("recommended_center_ratio", 0.6)
+    recommended_sigma_ratio = raw_config.get("recommended_sigma_ratio", 0.2)
+
+    # Extract metadata
+    layer_stats = {}
+    if "layer_stats" in raw_config:
+        layer_stats = {int(k): v for k, v in raw_config["layer_stats"].items()}
+
+    aggressive_layers = raw_config.get("aggressive_layers", [])
+    protected_layers = raw_config.get("protected_layers", [])
+
+    result = {
+        "per_layer_multipliers": per_layer_multipliers,
+        "exclude_layers": exclude_layers,
+        "target_layer_indices": target_layer_indices,
+        "recommended_center_ratio": recommended_center_ratio,
+        "recommended_sigma_ratio": recommended_sigma_ratio,
+        "metadata": {
+            "layer_stats": layer_stats,
+            "aggressive_layers": aggressive_layers,
+            "protected_layers": protected_layers,
+            "version": raw_config.get("version", "unknown"),
+            "generated_at": raw_config.get("generated_at"),
+            "analysis_params": raw_config.get("analysis_params", {}),
+        },
+    }
+
+    logger.info(f"Loaded layer target map from {path}")
+    logger.info(f"  - Target layers: {len(target_layer_indices)}")
+    logger.info(f"  - Excluded layers: {len(exclude_layers)}")
+    logger.info(f"  - Aggressive layers: {len(aggressive_layers)}")
+    logger.info(f"  - Protected layers: {len(protected_layers)}")
+
+    return result
+
+
+def validate_layer_target_map(target_map: dict, num_layers: int) -> list[str]:
+    """
+    Validate a layer target map against a model's architecture.
+
+    Checks that layer indices are valid and warns about gaps in coverage.
+
+    Args:
+        target_map: Parsed layer target map from load_layer_target_map()
+        num_layers: Total number of transformer layers in the model
+
+    Returns:
+        List of warning messages (empty if no issues found)
+    """
+    warnings = []
+
+    # Check layer indices don't exceed model layers
+    per_layer_multipliers = target_map.get("per_layer_multipliers", {})
+    for layer_idx in per_layer_multipliers.keys():
+        if layer_idx >= num_layers:
+            warnings.append(
+                f"Layer {layer_idx} in target map exceeds model layers ({num_layers})"
+            )
+
+    for layer_idx in target_map.get("exclude_layers", []):
+        if layer_idx >= num_layers:
+            warnings.append(
+                f"Excluded layer {layer_idx} exceeds model layers ({num_layers})"
+            )
+
+    # Check for layers not covered by map
+    covered_layers = set(per_layer_multipliers.keys())
+    covered_layers.update(target_map.get("exclude_layers", []))
+
+    # All layers that should be in the map
+    expected_layers = set(range(num_layers))
+    missing_layers = expected_layers - covered_layers
+
+    if missing_layers:
+        # This is informational - depends on unmapped_layer_behavior setting
+        missing_sorted = sorted(missing_layers)
+        if len(missing_sorted) <= 10:
+            warnings.append(f"Layers not in target map: {missing_sorted}")
+        else:
+            warnings.append(
+                f"Layers not in target map: {missing_sorted[:5]}...{missing_sorted[-5:]} "
+                f"({len(missing_sorted)} total)"
+            )
+
+    return warnings
 
 
 # Winsorization for Outlier-Robust Direction Computation
@@ -1369,6 +1523,8 @@ def get_layer_type_from_name(name: str) -> Optional[str]:
         "qkv_proj", "out_proj",                   # Alternative naming
         "fc1", "fc2",                             # GPT-style MLP
         "c_attn", "c_proj",                       # GPT-2 naming
+        "w1", "w2", "w3",                         # MoE expert layers (Mixtral/GptOss)
+        "router",                                  # MoE router
         "lm_head",                                # Output head
     ]
 
@@ -1484,14 +1640,23 @@ def abliterate_model(
         primary_direction = None
         logger.info("Using per-layer directions")
 
-    # Compute adaptive layer weights if enabled
-    adaptive_weights = None
-    if config.use_adaptive_weighting:
+    # Compute layer weights based on targeting mode
+    layer_weights = None
+    use_target_map = config.per_layer_multipliers is not None
+
+    if use_target_map:
+        # Use target map multipliers directly
+        layer_weights = config.per_layer_multipliers
+        logger.info(f"Using layer target map with {len(layer_weights)} layer multipliers")
+        if config.exclude_layers:
+            logger.info(f"  - Excluding {len(config.exclude_layers)} layers: {sorted(config.exclude_layers)[:10]}...")
+    elif config.use_adaptive_weighting:
+        # Fall back to Gaussian-based adaptive weighting
         layer_indices = [get_layer_index_from_name(n) for n in linear_names]
         max_layer = max((i for i in layer_indices if i is not None), default=0)
         num_layers = max_layer + 1
 
-        adaptive_weights = compute_adaptive_layer_weights(
+        layer_weights = compute_adaptive_layer_weights(
             num_layers,
             center=config.adaptive_position_center,
             sigma=config.adaptive_position_sigma,
@@ -1523,6 +1688,12 @@ def abliterate_model(
                 skipped_count += 1
                 continue
 
+        # Check excluded layers from target map
+        if config.exclude_layers and layer_idx is not None:
+            if layer_idx in config.exclude_layers:
+                skipped_count += 1
+                continue
+
         # Get direction (biprojected > per-layer > mean fallback)
         if primary_direction is not None:
             direction = primary_direction
@@ -1549,11 +1720,28 @@ def abliterate_model(
             if harmless_dir is not None:
                 harmless_dir = harmless_dir.to(config.device)
 
-        # Compute effective multiplier (with adaptive weighting if enabled)
+        # Compute effective multiplier (with layer targeting if enabled)
         effective_multiplier = config.direction_multiplier
-        if adaptive_weights is not None and layer_idx is not None:
-            layer_weight = adaptive_weights.get(layer_idx, 1.0)
+        if layer_weights is not None and layer_idx is not None:
+            if use_target_map:
+                # For target map: use multiplier from map, handle unmapped layers
+                if layer_idx in layer_weights:
+                    layer_weight = layer_weights[layer_idx]
+                elif config.unmapped_layer_behavior == "default":
+                    layer_weight = config.unmapped_layer_multiplier
+                else:
+                    # "skip" behavior - use 0.0 multiplier (effectively skips)
+                    layer_weight = 0.0
+            else:
+                # For adaptive weighting: use computed weight with 1.0 default
+                layer_weight = layer_weights.get(layer_idx, 1.0)
+
             effective_multiplier = config.direction_multiplier * layer_weight
+
+            # Skip if effective multiplier is zero
+            if effective_multiplier == 0.0:
+                skipped_count += 1
+                continue
 
         # Apply projection based on mode
         try:
@@ -2018,6 +2206,13 @@ def run_abliteration(config: AbliterationConfig):
         # Quality-based layer selection
         "use_quality_selection": config.use_quality_selection,
         "min_quality_threshold": config.min_quality_threshold if config.use_quality_selection else None,
+        # Layer target map
+        "layer_targeting_mode": config.layer_targeting_mode,
+        "layer_target_map_path": config.layer_target_map_path,
+        "exclude_layers": config.exclude_layers,
+        "unmapped_layer_behavior": config.unmapped_layer_behavior if config.layer_target_map_path else None,
+        "unmapped_layer_multiplier": config.unmapped_layer_multiplier if config.unmapped_layer_behavior == "default" else None,
+        "num_layers_with_multipliers": len(config.per_layer_multipliers) if config.per_layer_multipliers else None,
     }
     with open(output_path / "abliteration_config.json", "w") as f:
         json.dump(config_save, f, indent=2)

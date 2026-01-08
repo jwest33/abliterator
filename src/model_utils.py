@@ -7,12 +7,25 @@ VL models (like Qwen3-VL) and uses the appropriate AutoModel class.
 """
 
 import json
+import locale
 import logging
+import os
+import sys
 from pathlib import Path
 from typing import Tuple, Union
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Fix Windows encoding issues - set preferred encoding for file I/O
+if sys.platform == "win32":
+    # Try to set UTF-8 mode for the process
+    os.environ["PYTHONUTF8"] = "1"
+    # Set locale to UTF-8 if possible
+    try:
+        locale.setlocale(locale.LC_ALL, '.UTF-8')
+    except locale.Error:
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +37,7 @@ VL_ARCHITECTURES = {
     "llava_next": ["LlavaNextForConditionalGeneration"],
     "idefics2": ["Idefics2ForConditionalGeneration"],
     "paligemma": ["PaliGemmaForConditionalGeneration"],
+    "glm4v": ["Glm4vForConditionalGeneration"],
 }
 
 # Architectures that need special text-only loading even though they're multimodal
@@ -109,9 +123,42 @@ def load_model_and_tokenizer(
 
     # Load tokenizer (same for both VL and text models for abliteration purposes)
     logger.info(f"Loading tokenizer from {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, trust_remote_code=trust_remote_code
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+    except UnicodeDecodeError as e:
+        # Windows encoding issue - try with use_fast=False as fallback
+        logger.warning(f"Encoding error loading tokenizer, trying slow tokenizer: {e}")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=trust_remote_code, use_fast=False
+            )
+        except UnicodeDecodeError:
+            # Last resort: monkey-patch open to use UTF-8 for text mode only
+            import builtins
+            original_open = builtins.open
+            def utf8_open(file, mode='r', *args, **kwargs):
+                # Only patch text mode opens (no 'b' in mode)
+                if 'b' not in mode and 'encoding' not in kwargs:
+                    kwargs['encoding'] = 'utf-8'
+                    kwargs['errors'] = 'replace'
+                return original_open(file, mode, *args, **kwargs)
+            builtins.open = utf8_open
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_path, trust_remote_code=trust_remote_code
+                )
+            except UnicodeDecodeError as final_error:
+                builtins.open = original_open
+                raise RuntimeError(
+                    f"Failed to load tokenizer due to encoding issues: {final_error}\n"
+                    "On Windows, try running with UTF-8 mode:\n"
+                    "  set PYTHONUTF8=1 && abliterate\n"
+                    "Or: python -X utf8 -m src.cli"
+                ) from final_error
+            finally:
+                builtins.open = original_open
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
