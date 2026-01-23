@@ -303,7 +303,7 @@ def get_baseline_scores(config: SearchConfig) -> tuple[dict[str, float], float]:
     """
     if config.baseline_scores_path and Path(config.baseline_scores_path).exists():
         logger.info(f"Loading baseline scores from {config.baseline_scores_path}")
-        with open(config.baseline_scores_path) as f:
+        with open(config.baseline_scores_path, encoding="utf-8") as f:
             data = json.load(f)
         return data["scores"], data["refusal_rate"]
 
@@ -329,7 +329,7 @@ def get_baseline_scores(config: SearchConfig) -> tuple[dict[str, float], float]:
     # Save for future use
     baseline_path = Path(config.output_dir) / "baseline_scores.json"
     baseline_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(baseline_path, "w") as f:
+    with open(baseline_path, "w", encoding="utf-8") as f:
         json.dump({"scores": scores, "refusal_rate": refusal_rate}, f, indent=2)
     logger.info(f"Saved baseline scores to {baseline_path}")
 
@@ -488,7 +488,7 @@ def search_parameters(config: SearchConfig) -> list[EvalResult]:
 
             # Save trial results
             trial_results_path = trial_path / "search_results.json"
-            with open(trial_results_path, "w") as f:
+            with open(trial_results_path, "w", encoding="utf-8") as f:
                 json.dump({
                     "params": params,
                     "scores": scores,
@@ -718,7 +718,7 @@ Examples:
 
     # Save all results
     results_path = Path(config.output_dir) / "all_results.json"
-    with open(results_path, "w") as f:
+    with open(results_path, "w", encoding="utf-8") as f:
         json.dump(
             [
                 {

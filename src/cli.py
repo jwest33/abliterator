@@ -214,6 +214,7 @@ def get_abliteration_config() -> Optional[dict]:
     # If we loaded settings from a config, apply them and skip manual configuration
     if loaded_settings:
         config.update(loaded_settings)
+        config["_loaded_from_saved_config"] = True  # Flag to skip save prompt later
         console.print(f"\n[{THEME['success']}]Using settings from loaded config.[/{THEME['success']}]")
         return config
 
@@ -289,6 +290,7 @@ def get_abliteration_config() -> Optional[dict]:
     config["harmless_clamp_ratio"] = 0.1
     config["num_measurement_layers"] = 2
     config["intervention_range"] = (0.25, 0.95)
+    config["dynamic_layer_targeting"] = False
 
     if use_advanced:
         # Winsorization (recommended for Gemma models)
@@ -336,12 +338,30 @@ def get_abliteration_config() -> Optional[dict]:
         # Layer targeting options
         console.print(f"\n[bold {THEME['secondary']}]Layer Targeting[/bold {THEME['secondary']}]")
 
+        # Dynamic layer targeting (per-layer directions)
+        config["dynamic_layer_targeting"] = questionary.confirm(
+            "Enable dynamic layer targeting? (extract ALL layers, use per-layer directions & null-space)",
+            default=False,
+            style=custom_style,
+        ).ask()
+
+        if config["dynamic_layer_targeting"]:
+            console.print(f"[{THEME['muted']}]  → Activations will be extracted from all layers[/{THEME['muted']}]")
+            console.print(f"[{THEME['muted']}]  → Each layer gets its own refusal direction[/{THEME['muted']}]")
+            console.print(f"[{THEME['muted']}]  → Null-space projectors are computed per-layer[/{THEME['muted']}]")
+
+        # Explain how strength control works with dynamic targeting
+        strength_question = "How would you like to control per-layer ablation strength?"
+        if config["dynamic_layer_targeting"]:
+            console.print(f"\n[{THEME['muted']}]With dynamic targeting, each layer uses its own direction.[/{THEME['muted']}]")
+            console.print(f"[{THEME['muted']}]Strength control scales how much each layer's direction is applied.[/{THEME['muted']}]")
+
         layer_targeting_choice = questionary.select(
-            "How would you like to control per-layer ablation strength?",
+            strength_question,
             choices=[
-                questionary.Choice("None (uniform across layers)", value="none"),
-                questionary.Choice("Simple adaptive weighting (Gaussian)", value="adaptive"),
-                questionary.Choice("Layer target map (JSON file)", value="target_map"),
+                questionary.Choice("None (uniform strength across all layers)", value="none"),
+                questionary.Choice("Adaptive weighting (Gaussian, stronger in middle layers)", value="adaptive"),
+                questionary.Choice("Layer target map (JSON file with custom weights)", value="target_map"),
             ],
             style=custom_style,
         ).ask()
@@ -354,6 +374,8 @@ def get_abliteration_config() -> Optional[dict]:
         config["unmapped_layer_behavior"] = "skip"
 
         if layer_targeting_choice == "adaptive":
+            if config["dynamic_layer_targeting"]:
+                console.print(f"[{THEME['muted']}]  → Per-layer directions + Gaussian strength weighting[/{THEME['muted']}]")
             config["use_adaptive_weighting"] = True
 
         elif layer_targeting_choice == "target_map":
@@ -566,6 +588,8 @@ def run_abliteration(config: dict) -> bool:
                 per_layer_multipliers=config.get("per_layer_multipliers"),
                 exclude_layers=config.get("exclude_layers"),
                 unmapped_layer_behavior=config.get("unmapped_layer_behavior", "skip"),
+                # Dynamic layer targeting
+                dynamic_layer_targeting=config.get("dynamic_layer_targeting", False),
             )
 
             # Filter prompts if enabled
@@ -624,13 +648,17 @@ def run_abliteration(config: dict) -> bool:
                 console.print(f"[{THEME['warning']}]Output path exists, using: {output_path.name}[/{THEME['warning']}]")
             output_path.mkdir(parents=True, exist_ok=True)
 
-            model.save_pretrained(output_path, safe_serialization=True)
-            tokenizer.save_pretrained(output_path)
+            # Save model (handles FP8 dequantized models specially)
+            from src.abliterate import save_model_safe
+            save_model_safe(model, tokenizer, output_path)
             directions.save(str(output_path / "refusal_directions.pt"))
 
-            # Copy vision files for VL models (needed for GGUF mmproj export)
-            from src.abliterate import is_vision_model, copy_vision_files
+            # Preserve original model config fields that transformers might not save
+            from src.abliterate import is_vision_model, copy_vision_files, preserve_model_config, make_json_serializable
             source_path = Path(config["model_path"])
+            preserve_model_config(source_path, output_path)
+
+            # Copy vision files for VL models (needed for GGUF mmproj export)
             if is_vision_model(source_path):
                 progress.update(task, description="Copying vision encoder files...")
                 copied_files = copy_vision_files(source_path, output_path)
@@ -655,9 +683,10 @@ def run_abliteration(config: dict) -> bool:
                 "use_null_space": config.get("use_null_space", False),
                 "null_space_rank_ratio": config.get("null_space_rank_ratio"),
                 "use_adaptive_weighting": config.get("use_adaptive_weighting", False),
+                "dynamic_layer_targeting": config.get("dynamic_layer_targeting", False),
             }
-            with open(output_path / "abliteration_config.json", "w") as f:
-                json.dump(config_save, f, indent=2)
+            with open(output_path / "abliteration_config.json", "w", encoding="utf-8") as f:
+                json.dump(make_json_serializable(config_save), f, indent=2)
 
             progress.advance(task, 10)
 
@@ -673,7 +702,10 @@ def run_abliteration(config: dict) -> bool:
         return True
 
     except Exception as e:
-        display_error(f"Abliteration failed: {str(e)}")
+        import traceback
+        error_msg = str(e) if str(e) else repr(e)
+        display_error(f"Abliteration failed: {error_msg}")
+        console.print(f"[dim]{traceback.format_exc()}[/dim]")
         return False
 
 
@@ -1806,7 +1838,14 @@ def _select_training_config_for_abliteration() -> Optional[dict]:
 
 
 def _prompt_save_config_after_abliteration(config: dict) -> None:
-    """Prompt user to save abliteration settings as a training config."""
+    """Prompt user to save abliteration settings as a training config.
+
+    Skips the prompt if the config was loaded from a previously saved config.
+    """
+    # Skip if config was loaded from a saved config
+    if config.get("_loaded_from_saved_config"):
+        return
+
     save_config_prompt = questionary.confirm(
         "\nWould you like to save these settings as a training config?",
         default=False,
@@ -1816,11 +1855,21 @@ def _prompt_save_config_after_abliteration(config: dict) -> None:
     if not save_config_prompt:
         return
 
-    # Get config name
-    name = questionary.text(
-        "Config name:",
-        style=custom_style,
-    ).ask()
+    # Get config name (require non-empty, retry up to 3 times)
+    name = None
+    for _ in range(3):
+        name = questionary.text(
+            "Config name:",
+            style=custom_style,
+            validate=lambda x: len(x.strip()) > 0 or "Config name is required",
+        ).ask()
+
+        if name and name.strip():
+            name = name.strip()
+            break
+        elif name is None:
+            # User cancelled (Ctrl+C or Esc)
+            return
 
     if not name:
         display_warning("Config name required, not saved.")
@@ -2472,13 +2521,15 @@ def main_menu():
 @click.option("--intervention-end", type=float, default=0.95, help="Intervention range end (0.0-1.0)")
 @click.option("--layer-target-map", type=str, default=None, help="Path to layer_target_map.json for data-driven layer targeting")
 @click.option("--unmapped-layer-behavior", type=click.Choice(["skip", "default"]), default="skip", help="How to handle layers not in target map")
+# Dynamic layer targeting
+@click.option("--dynamic-layer-targeting/--no-dynamic-layer-targeting", default=False, help="Extract from ALL layers, apply per-layer directions and null-space projectors")
 def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
         no_norm_preservation, no_filter_prompts, device, dtype,
         winsorize, winsorize_percentile, null_space, preservation_prompts,
         null_space_rank_ratio, adaptive_weighting,
         projected, biprojection, per_neuron_norm, target_layers, harmless_boundary,
         harmless_clamp_ratio, num_measurement_layers, intervention_start, intervention_end,
-        layer_target_map, unmapped_layer_behavior):
+        layer_target_map, unmapped_layer_behavior, dynamic_layer_targeting):
     """
     Abliteration Toolkit - Remove refusal behavior from language models.
 
@@ -2491,6 +2542,12 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
       --null-space             Preserve model capabilities using null-space constraints
       --preservation-prompts   Custom prompts for null-space computation
       --adaptive-weighting     Per-layer adaptive ablation strength
+
+    Dynamic layer targeting (per-layer precision):
+    \b
+      --dynamic-layer-targeting  Extract activations from ALL layers and apply
+                                 per-layer refusal directions and null-space
+                                 projectors (instead of using averaged direction)
 
     Biprojection options (improved NatInt preservation):
     \b
@@ -2577,6 +2634,8 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
             "per_layer_multipliers": per_layer_multipliers,
             "exclude_layers": exclude_layers,
             "unmapped_layer_behavior": unmapped_layer_behavior,
+            # Dynamic layer targeting
+            "dynamic_layer_targeting": dynamic_layer_targeting,
         }
 
         display_banner()

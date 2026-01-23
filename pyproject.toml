@@ -41,7 +41,11 @@ feature-surgery = "src.feature_surgery_cli:main"
 dev = [
     "pytest>=7.0.0",
     "black>=23.0.0",
-    "ruff>=0.1.0",
+    "ruff>=0.1.0"
+]
+
+mistral = [
+    "mistral-common>=1.8.8",
 ]
 
 [tool.setuptools.packages.find]

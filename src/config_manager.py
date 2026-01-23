@@ -55,6 +55,8 @@ DEFAULT_SETTINGS = {
     "harmless_clamp_ratio": 0.1,
     "num_measurement_layers": 2,
     "intervention_range": [0.25, 0.95],
+    # Dynamic layer targeting
+    "dynamic_layer_targeting": False,
 }
 
 

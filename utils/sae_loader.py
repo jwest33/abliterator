@@ -99,19 +99,34 @@ class SAELoader:
     """
 
     # Known SAE repositories and their layer configurations
+    # GemmaScope 2 SAEs are trained on Gemma 3 models (not Gemma 2!)
     # Note: d_model is inferred from loaded weights, these are just for reference
     KNOWN_REPOS = {
+        # GemmaScope 1 (Gemma 2 models)
         "google/gemma-scope-2b-it": {
             "layers": list(range(26)),
+            "model_family": "gemma2",
         },
         "google/gemma-scope-2b-pt": {
             "layers": list(range(26)),
+            "model_family": "gemma2",
+        },
+        # GemmaScope 2 (Gemma 3 models) - naming is confusing but "gemma-scope-2" = version 2
+        "google/gemma-scope-2-1b-it": {
+            "layers": list(range(26)),  # Gemma 3 1B has 26 layers
+            "model_family": "gemma3",
         },
         "google/gemma-scope-2-4b-it": {
-            "layers": list(range(34)),  # Layers 0-33
+            "layers": list(range(34)),  # Gemma 3 4B has 34 layers
+            "model_family": "gemma3",
         },
         "google/gemma-scope-2-12b-it": {
-            "layers": list(range(42)),  # Layers 0-41
+            "layers": list(range(48)),  # Gemma 3 12B has 48 layers
+            "model_family": "gemma3",
+        },
+        "google/gemma-scope-2-27b-it": {
+            "layers": list(range(62)),  # Gemma 3 27B has 62 layers
+            "model_family": "gemma3",
         },
     }
 

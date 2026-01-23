@@ -29,6 +29,410 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Mapping of torch.dtype to string for JSON serialization
+DTYPE_TO_STRING = {
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.float32: "float32",
+    torch.float64: "float64",
+    torch.int8: "int8",
+    torch.int16: "int16",
+    torch.int32: "int32",
+    torch.int64: "int64",
+    torch.uint8: "uint8",
+    torch.bool: "bool",
+}
+
+
+def make_json_serializable(obj):
+    """Recursively convert non-JSON-serializable objects to serializable types.
+
+    Handles torch.dtype, torch.Tensor, Path objects, and nested dicts/lists.
+    """
+    if isinstance(obj, torch.dtype):
+        return DTYPE_TO_STRING.get(obj, str(obj))
+    elif isinstance(obj, torch.Tensor):
+        return obj.tolist()
+    elif isinstance(obj, Path):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [make_json_serializable(item) for item in obj]
+    elif hasattr(obj, '__dict__'):
+        # Handle dataclass-like objects that might have dtype attributes
+        return make_json_serializable(vars(obj))
+    return obj
+
+
+def _clean_config_dtypes_recursive(obj, visited=None) -> None:
+    """Recursively clean torch.dtype objects from a config object in-place.
+
+    Args:
+        obj: The object to clean (config, quantization_config, etc.)
+        visited: Set of visited object ids to avoid infinite recursion
+    """
+    if visited is None:
+        visited = set()
+
+    # Avoid infinite recursion on circular references
+    obj_id = id(obj)
+    if obj_id in visited:
+        return
+    visited.add(obj_id)
+
+    # Skip basic types that can't contain dtype attributes
+    if obj is None or isinstance(obj, (str, int, float, bool, bytes)):
+        return
+
+    # Handle dict-like objects
+    if isinstance(obj, dict):
+        for key, value in list(obj.items()):
+            if isinstance(value, torch.dtype):
+                obj[key] = DTYPE_TO_STRING.get(value, str(value))
+            else:
+                _clean_config_dtypes_recursive(value, visited)
+        return
+
+    # Handle lists and tuples
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            _clean_config_dtypes_recursive(item, visited)
+        return
+
+    # For objects with attributes, iterate over all attributes
+    if hasattr(obj, '__dict__'):
+        for attr_name in list(vars(obj).keys()):
+            try:
+                value = getattr(obj, attr_name)
+                if isinstance(value, torch.dtype):
+                    setattr(obj, attr_name, DTYPE_TO_STRING.get(value, str(value)))
+                elif not callable(value) and not attr_name.startswith('_'):
+                    _clean_config_dtypes_recursive(value, visited)
+            except (AttributeError, TypeError):
+                # Some attributes might be properties that raise on access
+                pass
+
+
+def clean_model_config_for_save(model) -> None:
+    """Clean the model's config to ensure it can be serialized to JSON.
+
+    Some models (especially FP8 quantized models like Mistral3) have config
+    attributes that contain torch.dtype objects which can't be JSON serialized.
+    This function converts those to strings in-place by recursively traversing
+    all config attributes.
+    """
+    if not hasattr(model, 'config'):
+        return
+
+    config = model.config
+
+    # Recursively clean all dtype objects in the entire config tree
+    _clean_config_dtypes_recursive(config)
+
+    # Also explicitly handle quantization_config via to_dict() for completeness
+    # Some quantization configs have special serialization logic
+    if hasattr(config, 'quantization_config') and config.quantization_config is not None:
+        qconfig = config.quantization_config
+        if hasattr(qconfig, 'to_dict'):
+            try:
+                qdict = qconfig.to_dict()
+                # Convert any dtype objects to strings and update attributes
+                for key, value in list(qdict.items()):
+                    if isinstance(value, torch.dtype):
+                        cleaned_value = DTYPE_TO_STRING.get(value, str(value))
+                        if hasattr(qconfig, key):
+                            setattr(qconfig, key, cleaned_value)
+            except Exception as e:
+                logger.debug(f"Could not clean quantization_config via to_dict: {e}")
+
+
+def _needs_manual_save(model) -> bool:
+    """Check if model needs manual saving due to irreversible weight conversions.
+
+    Detects FP8 dequantized models and other cases where transformers'
+    save_pretrained would fail with NotImplementedError.
+    """
+    # Check for quantization config indicators
+    if hasattr(model, 'config') and hasattr(model.config, 'quantization_config'):
+        qconfig = model.config.quantization_config
+        if qconfig is not None:
+            # Check various FP8/dequantization indicators
+            is_dequantized = getattr(qconfig, 'dequantize', False)
+            quant_method = str(getattr(qconfig, 'quant_method', '')).lower()
+            if is_dequantized or 'fp8' in quant_method:
+                return True
+
+    # Check for hf_quantizer (indicates quantization was applied during load)
+    if hasattr(model, 'hf_quantizer') and model.hf_quantizer is not None:
+        return True
+
+    # Check for weight conversion hooks/operations
+    if hasattr(model, '_hf_hook') and model._hf_hook is not None:
+        return True
+
+    # Check for Mistral3 models which typically need special handling
+    model_type = getattr(getattr(model, 'config', None), 'model_type', '')
+    if 'mistral3' in str(model_type).lower():
+        return True
+
+    return False
+
+
+def _save_model_manual(model, tokenizer, output_path: Path, target_dtype: torch.dtype = torch.float16) -> None:
+    """Manually save model using safetensors, bypassing transformers' weight conversion.
+
+    This function is specifically designed to handle FP8 dequantized models and ensure
+    the saved model is compatible with GGUF conversion tools like llama.cpp.
+
+    Key operations:
+    1. Filter out FP8 scale tensors (_scale_inv, _scale) that break GGUF conversion
+    2. Convert bfloat16 weights to float16 for broader GGUF compatibility
+    3. Clear quantization config that no longer applies after dequantization
+
+    Args:
+        model: The model to save
+        tokenizer: The tokenizer to save
+        output_path: Directory to save to
+        target_dtype: Target dtype for weights (default: float16 for GGUF compatibility)
+    """
+    from safetensors.torch import save_file
+
+    logger.info("Using manual save to bypass weight conversion")
+
+    # Clear quantization-related config
+    if hasattr(model, 'config'):
+        if hasattr(model.config, 'quantization_config'):
+            model.config.quantization_config = None
+        if hasattr(model.config, '_pre_quantization_dtype'):
+            delattr(model.config, '_pre_quantization_dtype')
+
+    # Get state dict and save with safetensors
+    raw_state_dict = model.state_dict()
+
+    # FP8 scale tensor patterns that must be filtered out for GGUF compatibility
+    # These tensors cause "ValueError: Can not map tensor" errors in convert_hf_to_gguf
+    fp8_scale_patterns = ('_scale_inv', '_scale', '.fp8_scale')
+
+    # Filter out FP8 scale tensors and convert dtypes
+    state_dict = {}
+    filtered_count = 0
+    converted_count = 0
+
+    for key, tensor in raw_state_dict.items():
+        # Skip FP8 scale tensors - they break GGUF conversion
+        if any(pattern in key for pattern in fp8_scale_patterns):
+            filtered_count += 1
+            continue
+
+        # Convert bfloat16 to float16 for GGUF compatibility
+        # llama.cpp's convert_hf_to_gguf downcasts bf16 to fp16 which can cause artifacts
+        # By doing the conversion here with proper rounding, we get cleaner results
+        if tensor.dtype == torch.bfloat16 and target_dtype == torch.float16:
+            tensor = tensor.to(torch.float16)
+            converted_count += 1
+        elif tensor.dtype != target_dtype and tensor.is_floating_point():
+            # Convert other floating point tensors to target dtype
+            tensor = tensor.to(target_dtype)
+            converted_count += 1
+
+        state_dict[key] = tensor
+
+    if filtered_count > 0:
+        logger.info(f"Filtered out {filtered_count} FP8 scale tensors for GGUF compatibility")
+    if converted_count > 0:
+        logger.info(f"Converted {converted_count} tensors to {target_dtype} for GGUF compatibility")
+
+    # Split into shards if needed (max 5GB per shard)
+    max_shard_size = 5 * 1024 * 1024 * 1024  # 5GB
+    total_size = sum(t.numel() * t.element_size() for t in state_dict.values())
+
+    if total_size > max_shard_size:
+        # Shard the model
+        logger.info(f"Model size ({total_size / 1e9:.2f}GB) exceeds shard limit, splitting...")
+        current_shard = {}
+        current_size = 0
+        shard_idx = 1
+        weight_map = {}
+
+        for key, tensor in state_dict.items():
+            tensor_size = tensor.numel() * tensor.element_size()
+            if current_size + tensor_size > max_shard_size and current_shard:
+                # Save current shard
+                shard_name = f"model-{shard_idx:05d}-of-XXXXX.safetensors"
+                save_file(current_shard, output_path / shard_name)
+                for k in current_shard:
+                    weight_map[k] = shard_name
+                current_shard = {}
+                current_size = 0
+                shard_idx += 1
+
+            current_shard[key] = tensor
+            current_size += tensor_size
+
+        # Save last shard
+        if current_shard:
+            shard_name = f"model-{shard_idx:05d}-of-{shard_idx:05d}.safetensors"
+            save_file(current_shard, output_path / shard_name)
+            for k in current_shard:
+                weight_map[k] = shard_name
+
+        # Rename shards with correct total count and save index
+        total_shards = shard_idx
+        for i in range(1, total_shards + 1):
+            old_name = output_path / f"model-{i:05d}-of-XXXXX.safetensors"
+            new_name = output_path / f"model-{i:05d}-of-{total_shards:05d}.safetensors"
+            if old_name.exists():
+                old_name.rename(new_name)
+                # Update weight map
+                for k, v in weight_map.items():
+                    if v == f"model-{i:05d}-of-XXXXX.safetensors":
+                        weight_map[k] = f"model-{i:05d}-of-{total_shards:05d}.safetensors"
+
+        # Save index file
+        index = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
+        with open(output_path / "model.safetensors.index.json", "w", encoding="utf-8") as f:
+            json.dump(index, f, indent=2)
+    else:
+        # Single file save
+        save_file(state_dict, output_path / "model.safetensors")
+
+    # Save config manually
+    model.config.save_pretrained(output_path)
+    tokenizer.save_pretrained(output_path)
+
+
+def _untie_shared_weights(model) -> None:
+    """Clone shared/tied weights to break memory sharing for safetensors save.
+
+    Models with tied weights (e.g., embed_tokens and lm_head sharing memory)
+    cause safetensors to fail. This function detects and clones shared weights
+    dynamically by checking data pointers.
+    """
+    state_dict = model.state_dict()
+    cloned_any = False
+
+    # Build a map of data pointers to tensor names
+    ptr_to_names: dict[int, list[str]] = {}
+    for name, tensor in state_dict.items():
+        ptr = tensor.data_ptr()
+        if ptr not in ptr_to_names:
+            ptr_to_names[ptr] = []
+        ptr_to_names[ptr].append(name)
+
+    # Find groups of tensors that share memory
+    for ptr, names in ptr_to_names.items():
+        if len(names) > 1:
+            logger.info(f"Found shared weights: {names}")
+            # Clone all but the first tensor in each group
+            for name in names[1:]:
+                logger.info(f"  Cloning: {name}")
+                # Get the original tensor and clone it
+                original_tensor = state_dict[name]
+                cloned_tensor = original_tensor.clone()
+
+                # Find the module and replace its weight/bias
+                parts = name.rsplit(".", 1)  # Split off the param name (weight/bias)
+                if len(parts) == 2:
+                    module_path, param_name = parts
+                    module = model
+                    for part in module_path.split("."):
+                        module = getattr(module, part, None)
+                        if module is None:
+                            break
+
+                    if module is not None and hasattr(module, param_name):
+                        setattr(module, param_name, torch.nn.Parameter(cloned_tensor))
+                        cloned_any = True
+
+    if cloned_any:
+        # Also set tie_word_embeddings to False in config if it exists
+        if hasattr(model.config, "tie_word_embeddings"):
+            model.config.tie_word_embeddings = False
+        # Handle nested configs (VL models)
+        if hasattr(model.config, "text_config") and hasattr(model.config.text_config, "tie_word_embeddings"):
+            model.config.text_config.tie_word_embeddings = False
+
+
+def save_model_safe(model, tokenizer, output_path: Path, target_dtype: torch.dtype = torch.float16) -> None:
+    """Save model and tokenizer, handling FP8 dequantized models specially.
+
+    For dequantized FP8 models (loaded with FineGrainedFP8Config(dequantize=True)),
+    transformers' save_pretrained fails with NotImplementedError when trying to
+    reverse the dequantization transform. This function bypasses that by saving
+    the state dict directly with safetensors.
+
+    For GGUF compatibility, weights are converted to float16 (the default) since
+    llama.cpp's converter can have issues with bfloat16 weights.
+
+    Args:
+        model: The model to save
+        tokenizer: The tokenizer to save
+        output_path: Directory to save to (must exist)
+        target_dtype: Target dtype for weights (default: float16 for GGUF compatibility)
+    """
+    # Clean model config first
+    clean_model_config_for_save(model)
+
+    # Check if this model needs manual saving
+    if _needs_manual_save(model):
+        _save_model_manual(model, tokenizer, output_path, target_dtype=target_dtype)
+        # Update config.json to reflect the actual weight dtype
+        _update_config_dtype(output_path, target_dtype)
+        return
+
+    # Try normal save, fall back to manual if it fails
+    try:
+        model.save_pretrained(output_path, safe_serialization=True)
+        tokenizer.save_pretrained(output_path)
+    except (NotImplementedError, RuntimeError) as e:
+        error_msg = str(e)
+        if "share memory" in error_msg or "shared" in error_msg.lower():
+            logger.warning("Model has tied/shared weights, using safe clone before save...")
+            # Clone tied weights to break sharing
+            _untie_shared_weights(model)
+            try:
+                model.save_pretrained(output_path, safe_serialization=True)
+                tokenizer.save_pretrained(output_path)
+                return
+            except Exception as e2:
+                logger.warning(f"Save after untying still failed: {e2}")
+        else:
+            logger.warning(f"save_pretrained failed: {e}")
+        logger.info("Falling back to manual save...")
+        _save_model_manual(model, tokenizer, output_path, target_dtype=target_dtype)
+        _update_config_dtype(output_path, target_dtype)
+
+
+def _update_config_dtype(output_path: Path, target_dtype: torch.dtype) -> None:
+    """Update config.json to reflect the actual weight dtype after conversion.
+
+    This is important for GGUF conversion tools that read torch_dtype from config.
+
+    Args:
+        output_path: Path to the model directory
+        target_dtype: The dtype the weights were converted to
+    """
+    config_path = output_path / "config.json"
+    if not config_path.exists():
+        return
+
+    dtype_str = DTYPE_TO_STRING.get(target_dtype, "float16")
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        config["torch_dtype"] = dtype_str
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+
+        logger.debug(f"Updated config.json torch_dtype to {dtype_str}")
+    except (json.JSONDecodeError, IOError) as e:
+        logger.warning(f"Could not update config.json dtype: {e}")
+
+
 def get_package_root() -> Path:
     """Get the root directory of the abliteration package.
 
@@ -81,7 +485,7 @@ def copy_vision_files(source_path: Path, dest_path: Path) -> list[str]:
     ]
 
     # Also copy any files with "vision" or "image" in the name
-    vision_patterns = ["*vision*", "*image*", "*visual*", "*processor*"]
+    vision_patterns = ["*vision*", "*image*", "*visual*", "*processor*", "*pixtral*"]
 
     copied_files = []
     source_path = Path(source_path)
@@ -110,56 +514,262 @@ def copy_vision_files(source_path: Path, dest_path: Path) -> list[str]:
     return copied_files
 
 
-def is_vision_model(model_path: Path) -> bool:
-    """Check if a model is a Vision-Language model based on config.
+def copy_essential_model_files(source_path: Path, dest_path: Path) -> list[str]:
+    """Copy essential model files that save_pretrained doesn't handle.
+
+    This includes tokenizer vocabulary files, generation config, and other
+    model-specific files that aren't part of the core model/tokenizer save.
+
+    Args:
+        source_path: Path to the original model directory
+        dest_path: Path to the abliterated model directory
+
+    Returns:
+        List of filenames that were copied
+    """
+    # Essential files that should be copied if present
+    essential_files = [
+        # Generation config
+        "generation_config.json",
+        # Custom tokenizer files (various model families)
+        "tekken.json",           # Ministral/Mistral tokenizer
+        "merges.txt",            # BPE merges file
+        "vocab.json",            # Vocabulary file
+        "added_tokens.json",     # Additional tokens
+        "special_tokens_map.json",  # Special token mappings
+        # Model params
+        "params.json",           # Mistral-style params
+        # Chat templates (if not already saved by tokenizer)
+        "chat_template.jinja",   # Jinja2 chat template
+        "chat_template.json",    # JSON chat template
+        # Other config files
+        "preprocessor_config.json",
+    ]
+
+    copied_files = []
+    source_path = Path(source_path)
+    dest_path = Path(dest_path)
+
+    for filename in essential_files:
+        src_file = source_path / filename
+        if src_file.exists():
+            dst_file = dest_path / filename
+            if not dst_file.exists():
+                shutil.copy2(src_file, dst_file)
+                copied_files.append(filename)
+                logger.debug(f"Copied essential file: {filename}")
+
+    return copied_files
+
+
+def preserve_model_config(source_path: Path, dest_path: Path) -> None:
+    """Preserve original model config.json fields after save_pretrained.
+
+    When transformers saves a model, it may not preserve all config fields,
+    especially for newer model architectures or custom fields. This function
+    reads the original config.json and merges any missing fields into the
+    saved config.json.
+
+    Note: quantization_config is intentionally NOT preserved because models
+    that were dequantized during loading (e.g., FP8 models with dequantize=True)
+    no longer have the scale factors that the quantization config expects.
+    Preserving it would cause loading errors when the model is later loaded.
+
+    Args:
+        source_path: Path to the original model directory
+        dest_path: Path to the saved model directory
+    """
+    source_config_path = source_path / "config.json"
+    dest_config_path = dest_path / "config.json"
+
+    if not source_config_path.exists() or not dest_config_path.exists():
+        logger.debug("Cannot preserve config: source or dest config.json not found")
+        return
+
+    try:
+        # Read original config
+        with open(source_config_path, "r", encoding="utf-8") as f:
+            original_config = json.load(f)
+
+        # Read saved config
+        with open(dest_config_path, "r", encoding="utf-8") as f:
+            saved_config = json.load(f)
+
+        # Track fields that were preserved
+        preserved_fields = []
+
+        # Fields to NOT preserve - these are invalidated by dequantization
+        # or other transformations during abliteration
+        # These fields cause issues with GGUF conversion if present
+        skip_fields = {
+            "quantization_config",  # FP8 scale factors no longer exist after dequantization
+            "_pre_quantization_dtype",  # Internal quantization state
+            "_name_or_path",  # Can cause confusion with converted models
+        }
+
+        # Also check for and remove any nested quantization-related configs
+        # that might confuse GGUF converters
+        quant_related_keys = [k for k in saved_config.keys()
+                              if 'quant' in k.lower() or 'fp8' in k.lower()]
+        for key in quant_related_keys:
+            skip_fields.add(key)
+
+        # Remove fields that should not be present after dequantization
+        removed_fields = []
+        for field in skip_fields:
+            if field in saved_config:
+                del saved_config[field]
+                removed_fields.append(field)
+
+        # Merge missing fields from original to saved
+        # Preserve original values - don't overwrite what transformers saved
+        # unless the field is completely missing
+        for key, value in original_config.items():
+            if key not in saved_config and key not in skip_fields:
+                saved_config[key] = value
+                preserved_fields.append(key)
+
+        # Also ensure architectures matches original (transformers might change it)
+        if "architectures" in original_config:
+            if saved_config.get("architectures") != original_config["architectures"]:
+                saved_config["architectures"] = original_config["architectures"]
+                if "architectures" not in preserved_fields:
+                    preserved_fields.append("architectures")
+
+        # Write merged config back
+        if preserved_fields or removed_fields:
+            with open(dest_config_path, "w", encoding="utf-8") as f:
+                json.dump(saved_config, f, indent=2)
+            if removed_fields:
+                logger.info(f"Removed invalidated config fields: {removed_fields}")
+            if preserved_fields:
+                logger.info(f"Preserved {len(preserved_fields)} config fields from original: {preserved_fields}")
+
+    except (json.JSONDecodeError, IOError) as e:
+        logger.warning(f"Failed to preserve model config: {e}")
+
+
+def _has_vision_weights(model_path: Path) -> bool:
+    """Check if a model has actual vision encoder weights in its files.
+
+    This is the definitive test for VL capability - checking for actual
+    vision encoder weights rather than just architecture names.
 
     Args:
         model_path: Path to the model directory
 
     Returns:
-        True if the model appears to be a VL model
+        True if vision encoder weights are found
+    """
+    import struct
+
+    vision_prefixes = [
+        "vision_tower", "vision_model", "visual_encoder",
+        "vision_encoder", "image_encoder", "vit.", "visual.",
+        "model.vision_tower", "model.vision_model",
+    ]
+
+    # Check safetensors index for vision-related weight names
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map", {})
+            for weight_name in weight_map.keys():
+                weight_lower = weight_name.lower()
+                if any(prefix in weight_lower for prefix in vision_prefixes):
+                    return True
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    # Check single safetensors file header
+    single_safetensors = model_path / "model.safetensors"
+    if single_safetensors.exists():
+        try:
+            with open(single_safetensors, "rb") as f:
+                header_size = struct.unpack("<Q", f.read(8))[0]
+                header_json = f.read(header_size).decode("utf-8")
+                header = json.loads(header_json)
+                for weight_name in header.keys():
+                    if weight_name == "__metadata__":
+                        continue
+                    weight_lower = weight_name.lower()
+                    if any(prefix in weight_lower for prefix in vision_prefixes):
+                        return True
+        except (struct.error, json.JSONDecodeError, IOError):
+            pass
+
+    return False
+
+
+def is_vision_model(model_path: Path) -> bool:
+    """Check if a model is a Vision-Language model.
+
+    Uses a two-stage check:
+    1. First checks architecture/config hints for VL capability
+    2. Then verifies actual vision weights exist (to avoid false positives
+       for models like Ministral 3B that use VL-capable architectures
+       but don't have vision weights)
+
+    Args:
+        model_path: Path to the model directory
+
+    Returns:
+        True if the model has actual vision capability
     """
     config_path = model_path / "config.json"
+
+    # First check if architecture/config suggests VL capability
+    is_vl_architecture = False
+
     if not config_path.exists():
         # Fall back to name-based detection
         model_name_lower = model_path.name.lower()
-        return any(kw in model_name_lower for kw in ["vl", "vision", "llava", "visual"])
+        is_vl_architecture = any(kw in model_name_lower for kw in ["vl", "vision", "llava", "visual", "pixtral"])
+    else:
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
 
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
+            # Check for VL architectures
+            vl_architectures = [
+                "Qwen2VLForConditionalGeneration",
+                "Qwen2_5_VLForConditionalGeneration",
+                "Qwen3VLForConditionalGeneration",
+                "LlavaForConditionalGeneration",
+                "LlavaNextForConditionalGeneration",
+                "MllamaForConditionalGeneration",
+                "InternVLChatModel",
+                "PaliGemmaForConditionalGeneration",
+                "Idefics2ForConditionalGeneration",
+                "MiniCPMV",
+                "Phi3VForCausalLM",
+                "Mistral3ForConditionalGeneration",
+            ]
 
-        # Check for VL architectures
-        vl_architectures = [
-            "Qwen2VLForConditionalGeneration",
-            "Qwen2_5_VLForConditionalGeneration",
-            "Qwen3VLForConditionalGeneration",
-            "LlavaForConditionalGeneration",
-            "LlavaNextForConditionalGeneration",
-            "MllamaForConditionalGeneration",
-            "InternVLChatModel",
-            "PaliGemmaForConditionalGeneration",
-            "Idefics2ForConditionalGeneration",
-            "MiniCPMV",
-            "Phi3VForCausalLM",
-        ]
+            architectures = config.get("architectures", [])
+            for arch in architectures:
+                if arch in vl_architectures:
+                    is_vl_architecture = True
+                    break
 
-        architectures = config.get("architectures", [])
-        for arch in architectures:
-            if arch in vl_architectures:
-                return True
+            # Check for vision_config
+            if "vision_config" in config or "visual" in config:
+                is_vl_architecture = True
 
-        # Check for vision_config
-        if "vision_config" in config or "visual" in config:
-            return True
+            # Check model_type
+            model_type = config.get("model_type", "").lower()
+            if any(kw in model_type for kw in ["vl", "vision", "llava"]):
+                is_vl_architecture = True
 
-        # Check model_type
-        model_type = config.get("model_type", "").lower()
-        if any(kw in model_type for kw in ["vl", "vision", "llava"]):
-            return True
+        except (json.JSONDecodeError, IOError):
+            pass
 
-    except (json.JSONDecodeError, IOError):
-        pass
+    # If architecture suggests VL, verify by checking for actual vision weights
+    # This prevents false positives for models like Ministral 3B
+    if is_vl_architecture:
+        return _has_vision_weights(model_path)
 
     return False
 
@@ -263,6 +873,9 @@ class AbliterationConfig:
     unmapped_layer_behavior: str = "skip"  # "skip" or "default"
     unmapped_layer_multiplier: float = 1.0  # Multiplier for layers not in map (when behavior="default")
 
+    # Dynamic layer targeting: extract from ALL layers and apply per-layer directions/projectors
+    dynamic_layer_targeting: bool = False  # When True: extract all layers, use per-layer directions
+
 
 @dataclass
 class RefusalDirections:
@@ -330,6 +943,10 @@ class ActivationExtractor:
             # Structure: model.model.model.layers (VL wrapper -> multimodal -> text -> layers)
             if hasattr(self.model.model, "model") and hasattr(self.model.model.model, "layers"):
                 return self.model.model.model.layers
+            # VL MoE models and Mistral3 (Qwen3-VL-MoE, Qwen2-VL-MoE, Mistral3, etc.)
+            # Structure: model.model.language_model.layers
+            if hasattr(self.model.model, "language_model") and hasattr(self.model.model.language_model, "layers"):
+                return self.model.model.language_model.layers
             # Standard text models (Llama, Qwen, etc.)
             # Structure: model.model.layers
             if hasattr(self.model.model, "layers"):
@@ -489,13 +1106,19 @@ class ActivationExtractor:
             else:
                 formatted_prompts = batch_prompts
 
+            # Use longer max_length to accommodate models with long system prompts
+            # (e.g., Ministral-3 has ~500 token system prompt)
+            # Also set padding_side to left for proper batch handling
+            original_padding_side = self.tokenizer.padding_side
+            self.tokenizer.padding_side = "left"
             inputs = self.tokenizer(
                 formatted_prompts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=512,
+                max_length=2048,
             ).to(self.config.device)
+            self.tokenizer.padding_side = original_padding_side
 
             # Forward pass to trigger hooks
             _ = self.model(**inputs)
@@ -1049,7 +1672,11 @@ def compute_refusal_directions(
     layers = extractor._get_layers()
     num_layers = len(layers)
 
-    if config.extraction_layer_indices is None:
+    if config.dynamic_layer_targeting:
+        # Dynamic layer targeting: extract from ALL layers
+        extraction_layers = list(range(num_layers))
+        logger.info(f"Dynamic layer targeting enabled: extracting from all {num_layers} layers")
+    elif config.extraction_layer_indices is None:
         # Default: extract from middle-to-later layers
         extraction_layers = list(range(num_layers // 4, 3 * num_layers // 4))
     else:
@@ -2000,8 +2627,15 @@ def filter_harmful_prompts_by_refusal(
 
 def run_abliteration(config: AbliterationConfig):
     """Run the complete abliteration pipeline."""
+    # Dynamic layer targeting implies per-layer directions
+    if config.dynamic_layer_targeting:
+        config.use_mean_direction = False
+        logger.info("Dynamic layer targeting enabled: using per-layer directions")
+
     logger.info("=" * 60)
     features = ["Norm-Preserving Abliteration"]
+    if config.dynamic_layer_targeting:
+        features.append("Dynamic Layer Targeting")
     if config.use_biprojection:
         features.append("Biprojection")
     if config.use_per_neuron_norm:
@@ -2133,11 +2767,19 @@ def run_abliteration(config: AbliterationConfig):
     logger.info(f"Saving abliterated model to {output_path}...")
     output_path.mkdir(parents=True, exist_ok=True)
 
-    model.save_pretrained(output_path, safe_serialization=True)
-    tokenizer.save_pretrained(output_path)
+    # Save model and tokenizer (handles FP8 dequantized models specially)
+    save_model_safe(model, tokenizer, output_path)
+
+    # Preserve original model config fields that transformers might not save
+    source_path = Path(config.model_path)
+    preserve_model_config(source_path, output_path)
+
+    # Copy essential model files (tokenizer vocab, generation config, etc.)
+    essential_copied = copy_essential_model_files(source_path, output_path)
+    if essential_copied:
+        logger.info(f"Copied {len(essential_copied)} essential files: {', '.join(essential_copied)}")
 
     # Copy vision files for VL models (needed for GGUF mmproj export)
-    source_path = Path(config.model_path)
     if is_vision_model(source_path):
         logger.info("Detected Vision-Language model, copying vision encoder files...")
         copied_files = copy_vision_files(source_path, output_path)
@@ -2213,9 +2855,11 @@ def run_abliteration(config: AbliterationConfig):
         "unmapped_layer_behavior": config.unmapped_layer_behavior if config.layer_target_map_path else None,
         "unmapped_layer_multiplier": config.unmapped_layer_multiplier if config.unmapped_layer_behavior == "default" else None,
         "num_layers_with_multipliers": len(config.per_layer_multipliers) if config.per_layer_multipliers else None,
+        # Dynamic layer targeting
+        "dynamic_layer_targeting": config.dynamic_layer_targeting,
     }
-    with open(output_path / "abliteration_config.json", "w") as f:
-        json.dump(config_save, f, indent=2)
+    with open(output_path / "abliteration_config.json", "w", encoding="utf-8") as f:
+        json.dump(make_json_serializable(config_save), f, indent=2)
 
     logger.info("=" * 60)
     logger.info("Abliteration complete!")

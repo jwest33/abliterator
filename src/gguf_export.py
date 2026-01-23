@@ -36,10 +36,12 @@ VL_ARCHITECTURES = [
     "Idefics3ForConditionalGeneration",
     "MiniCPMV",
     "Phi3VForCausalLM",
+    "Mistral3ForConditionalGeneration",  # Mistral 3 with Pixtral vision
 ]
 
 # Keywords in model names that suggest vision capability
-VL_NAME_KEYWORDS = ["vl", "vision", "llava", "visual", "minicpm-v", "internvl"]
+# Note: "mistral3" removed as not all Mistral3 models have vision (e.g., Ministral 3B is text-only)
+VL_NAME_KEYWORDS = ["vl", "vision", "llava", "visual", "minicpm-v", "internvl", "pixtral"]
 
 
 @dataclass
@@ -149,6 +151,14 @@ def detect_vision_model(model_path: Path) -> tuple[bool, Optional[str]]:
     """
     Detect if a model is a Vision-Language (VL) model.
 
+    Uses a two-stage approach:
+    1. First checks if architecture/config/name suggests VL capability
+    2. Then verifies actual vision weights exist (definitive test)
+
+    This prevents false positives for models like Ministral 3B that use
+    VL-capable architectures (Mistral3ForConditionalGeneration) but don't
+    actually have vision encoder weights.
+
     Args:
         model_path: Path to the HuggingFace model directory
 
@@ -156,45 +166,61 @@ def detect_vision_model(model_path: Path) -> tuple[bool, Optional[str]]:
         Tuple of (is_vision_model, architecture_name)
     """
     config_path = model_path / "config.json"
+    is_vl_architecture = False
+    arch_name = None
 
     if not config_path.exists():
         # Fall back to name-based detection
         model_name_lower = model_path.name.lower()
         for keyword in VL_NAME_KEYWORDS:
             if keyword in model_name_lower:
-                return True, None
-        return False, None
+                is_vl_architecture = True
+                break
+    else:
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
 
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
+            # Check architectures field
+            architectures = config.get("architectures", [])
+            arch_name = architectures[0] if architectures else None
 
-        # Check architectures field
-        architectures = config.get("architectures", [])
-        for arch in architectures:
-            if arch in VL_ARCHITECTURES:
-                return True, arch
+            for arch in architectures:
+                if arch in VL_ARCHITECTURES:
+                    is_vl_architecture = True
+                    arch_name = arch
+                    break
 
-        # Check model_type for vision indicators
-        model_type = config.get("model_type", "").lower()
-        if any(kw in model_type for kw in ["vl", "vision", "llava"]):
-            return True, config.get("architectures", [None])[0]
+            # Check model_type for vision indicators
+            if not is_vl_architecture:
+                model_type = config.get("model_type", "").lower()
+                if any(kw in model_type for kw in ["vl", "vision", "llava"]):
+                    is_vl_architecture = True
 
-        arch_name = architectures[0] if architectures else ""
+            # Check for vision_config in config
+            if not is_vl_architecture:
+                if "vision_config" in config or "visual" in config:
+                    is_vl_architecture = True
 
-        # Check for actual vision encoder weights in the model files
-        # This is the definitive test - config may have vision_config but no weights
+        except (json.JSONDecodeError, IOError):
+            pass
+
+        # Fall back to name-based detection
+        if not is_vl_architecture:
+            model_name_lower = model_path.name.lower()
+            for keyword in VL_NAME_KEYWORDS:
+                if keyword in model_name_lower:
+                    is_vl_architecture = True
+                    break
+
+    # If architecture/config suggests VL, verify by checking for actual vision weights
+    # This is the definitive test - prevents false positives
+    if is_vl_architecture:
         if _has_vision_weights(model_path):
-            return True, arch_name or None
-
-    except (json.JSONDecodeError, IOError):
-        pass
-
-    # Fall back to name-based detection
-    model_name_lower = model_path.name.lower()
-    for keyword in VL_NAME_KEYWORDS:
-        if keyword in model_name_lower:
-            return True, None
+            return True, arch_name
+        else:
+            # Architecture suggests VL but no vision weights found
+            return False, None
 
     return False, None
 
@@ -235,13 +261,16 @@ def find_llama_cpp_path() -> Optional[Path]:
 
     # Common installation paths
     common_paths = [
+        Path("D:/llamacpp"),
+        Path("D:/llama.cpp"),
         Path.home() / "llama.cpp",
+        Path.home() / "llamacpp",
         Path.home() / "projects" / "llama.cpp",
         Path.home() / "code" / "llama.cpp",
         Path("../llama.cpp"),
         Path("../../llama.cpp"),
+        Path("C:/llamacpp"),
         Path("C:/llama.cpp"),
-        Path("D:/llama.cpp"),
         Path("/usr/local/llama.cpp"),
         Path("/opt/llama.cpp"),
     ]
@@ -263,7 +292,15 @@ def find_convert_script(llama_cpp_path: Optional[Path] = None) -> Optional[Path]
         if script.exists():
             return script
 
-    # Check if it's in PATH (as a command)
+    # Try to find llama.cpp installation from known paths first
+    # (before PATH, since PATH may have an older version)
+    found_path = find_llama_cpp_path()
+    if found_path:
+        script = found_path / "convert_hf_to_gguf.py"
+        if script.exists():
+            return script
+
+    # Fall back to PATH (as a command)
     which_result = shutil.which("convert_hf_to_gguf.py")
     if which_result:
         return Path(which_result)
@@ -272,13 +309,6 @@ def find_convert_script(llama_cpp_path: Optional[Path] = None) -> Optional[Path]
     which_result = shutil.which("convert-hf-to-gguf")
     if which_result:
         return Path(which_result)
-
-    # Try to find llama.cpp installation
-    found_path = find_llama_cpp_path()
-    if found_path:
-        script = found_path / "convert_hf_to_gguf.py"
-        if script.exists():
-            return script
 
     return None
 
@@ -431,16 +461,23 @@ def convert_hf_to_gguf(
             check=False,
         )
 
+        # Check if output was created - prioritize this over return code
+        # Some conversion scripts return non-zero codes for warnings
+        if output_path.exists() and output_path.stat().st_size > 0:
+            if result.returncode != 0 and progress_callback:
+                # Log warning but don't fail if file was created
+                progress_callback(f"Conversion completed with warnings (code {result.returncode})")
+            return True
+
         if result.returncode != 0:
             if progress_callback:
-                # Show both stderr and stdout for debugging
-                error_msg = result.stderr or result.stdout or "Unknown error"
-                progress_callback(f"Conversion error (code {result.returncode}): {error_msg[:500]}")
+                # Show stderr (where errors usually are), or tail of stdout
+                error_msg = result.stderr.strip() if result.stderr else ""
+                if not error_msg and result.stdout:
+                    # Show last 1000 chars of stdout to capture the actual error
+                    error_msg = result.stdout.strip()[-1000:]
+                progress_callback(f"Conversion error (code {result.returncode}): {error_msg or 'Unknown error'}")
             return False
-
-        # Check if output was created
-        if output_path.exists():
-            return True
 
         # Output might not exist if only --mmproj was requested
         # In that case, consider it a success if no error was reported

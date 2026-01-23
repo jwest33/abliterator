@@ -366,6 +366,9 @@ class NullSpaceActivationExtractor:
         if hasattr(self.model, "model"):
             if hasattr(self.model.model, "model") and hasattr(self.model.model.model, "layers"):
                 return self.model.model.model.layers
+            # VL MoE models and Mistral3 (Qwen3-VL-MoE, Mistral3, etc.)
+            if hasattr(self.model.model, "language_model") and hasattr(self.model.model.language_model, "layers"):
+                return self.model.model.language_model.layers
             if hasattr(self.model.model, "layers"):
                 return self.model.model.layers
             elif hasattr(self.model.model, "decoder") and hasattr(self.model.model.decoder, "layers"):

@@ -1132,7 +1132,7 @@ Examples:
 
     elif args.command == "compare":
         if args.test_prompts:
-            with open(args.test_prompts) as f:
+            with open(args.test_prompts, encoding="utf-8") as f:
                 test_prompts = json.load(f)
         else:
             test_prompts = DEFAULT_TEST_PROMPTS
@@ -1146,13 +1146,13 @@ Examples:
         )
 
         if args.output:
-            with open(args.output, "w") as f:
+            with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(results, f, indent=2)
             logger.info(f"Results saved to {args.output}")
 
     elif args.command == "test":
         if args.test_prompts:
-            with open(args.test_prompts) as f:
+            with open(args.test_prompts, encoding="utf-8") as f:
                 test_prompts = json.load(f)
         else:
             test_prompts = DEFAULT_TEST_PROMPTS
@@ -1165,7 +1165,7 @@ Examples:
         )
 
         if args.output:
-            with open(args.output, "w") as f:
+            with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(results, f, indent=2)
             logger.info(f"Results saved to {args.output}")
 

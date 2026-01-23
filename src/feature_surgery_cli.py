@@ -111,8 +111,8 @@ Examples:
     sae_group = parser.add_argument_group("SAE Configuration")
     sae_group.add_argument(
         "--sae-repo",
-        default="google/gemma-scope-2-12b-it",
-        help="SAE repository ID (default: google/gemma-scope-2-12b-it)",
+        default="google/gemma-scope-2-4b-it",
+        help="SAE repository ID (default: google/gemma-scope-2-4b-it)",
     )
     sae_group.add_argument(
         "--sae-width",
@@ -191,7 +191,7 @@ Examples:
     options_group.add_argument(
         "--skip-validation",
         action="store_true",
-        help="Skip SAE compatibility validation",
+        help="Skip SAE-model dimension validation (NOT RECOMMENDED - may corrupt model architecture)",
     )
     options_group.add_argument(
         "--download-sae",
@@ -306,22 +306,28 @@ def main():
     dtype = get_dtype(args.dtype)
     pipeline.load_model(args.model, dtype=dtype)
 
-    # Validate SAE compatibility
-    if not args.skip_validation:
-        logger.info("Validating SAE compatibility...")
-        compatible = pipeline.validate_sae_compatibility()
-        if not compatible:
-            logger.warning(
-                "SAE dimensions may not match model. "
-                "Use --skip-validation to proceed anyway."
-            )
-
-    # Run surgery
+    # Run surgery (validation is now done automatically inside run() unless skipped)
     logger.info(f"Running feature surgery ({'dry run' if args.dry_run else 'applying changes'})...")
-    stats = pipeline.run(
-        output_path=args.output if not args.dry_run else None,
-        dry_run=args.dry_run,
-    )
+    try:
+        stats = pipeline.run(
+            output_path=args.output if not args.dry_run else None,
+            dry_run=args.dry_run,
+            skip_validation=args.skip_validation,
+        )
+    except ValueError as e:
+        if "dimension mismatch" in str(e).lower():
+            logger.error(
+                f"SAE-model dimension mismatch: {e}\n"
+                "This typically means you're using an SAE trained on a different model.\n"
+                "Common causes:\n"
+                "  - Using gemma-scope-2-12b-it SAEs on a Gemma 3 model\n"
+                "  - Using gemma-scope-2-4b-it SAEs on a different sized model\n"
+                "Solutions:\n"
+                "  1. Use the correct SAE repo for your model (e.g., --sae-repo google/gemma-scope-2-4b-it)\n"
+                "  2. Use --skip-validation to proceed anyway (NOT RECOMMENDED - may corrupt model)"
+            )
+            sys.exit(1)
+        raise
 
     # Print summary
     print("\n" + "=" * 60)

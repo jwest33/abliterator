@@ -24,6 +24,8 @@ import torch.nn as nn
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.abliterate import make_json_serializable, clean_model_config_for_save
+
 logger = logging.getLogger(__name__)
 
 # Small epsilon for numerical stability
@@ -65,10 +67,10 @@ class FeatureSurgeryConfig:
     features: list[FeatureSpec] = field(default_factory=list)
 
     # SAE configuration (for loading decoders)
-    sae_repo: str = "google/gemma-scope-2-12b-it"
+    sae_repo: str = "google/gemma-scope-2-4b-it"
     sae_width: str = "16k"
     sae_l0: str = "small"
-    sae_type: str = "resid_post_all"  # 12b uses resid_post_all, 4b uses resid_post
+    sae_type: str = "resid_post_all"  # 4b uses resid_post_all, 4b uses resid_post
     sae_local_only: bool = True  # Use cached files only, don't download
 
     # Surgery parameters
@@ -111,7 +113,7 @@ class FeatureSurgeryConfig:
         features = [FeatureSpec.from_dict(f) for f in d.get("features", [])]
         return cls(
             features=features,
-            sae_repo=d.get("sae_repo", "google/gemma-scope-2-12b-it"),
+            sae_repo=d.get("sae_repo", "google/gemma-scope-2-4b-it"),
             sae_width=d.get("sae_width", "16k"),
             sae_l0=d.get("sae_l0", "small"),
             sae_type=d.get("sae_type", "resid_post_all"),
@@ -595,6 +597,7 @@ class FeatureSurgeryPipeline:
         self.model = None
         self.tokenizer = None
         self._surgery = None
+        self._source_model_path = None  # Track source for config file copying
 
     @classmethod
     def from_differential_features(
@@ -603,7 +606,7 @@ class FeatureSurgeryPipeline:
         top_k_per_layer: int = 10,
         weaken_strength: float = 0.3,
         strengthen_strength: float = 1.5,
-        sae_repo: str = "google/gemma-scope-2-12b-it",
+        sae_repo: str = "google/gemma-scope-2-4b-it",
         **config_kwargs,
     ) -> "FeatureSurgeryPipeline":
         """
@@ -671,7 +674,7 @@ class FeatureSurgeryPipeline:
     def from_feature_list(
         cls,
         features: list[dict],
-        sae_repo: str = "google/gemma-scope-2-12b-it",
+        sae_repo: str = "google/gemma-scope-2-4b-it",
         **config_kwargs,
     ) -> "FeatureSurgeryPipeline":
         """
@@ -732,6 +735,9 @@ class FeatureSurgeryPipeline:
         if dtype is None:
             dtype = torch.float16
 
+        # Store source path for config file copying during save
+        self._source_model_path = model_path
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
@@ -748,12 +754,18 @@ class FeatureSurgeryPipeline:
 
         return self.model
 
-    def validate_sae_compatibility(self) -> bool:
+    def validate_sae_compatibility(self, strict: bool = True) -> bool:
         """
         Check if SAE dimensions match the model.
 
+        Args:
+            strict: If True, raise error on mismatch; if False, warn only
+
         Returns:
             True if compatible
+
+        Raises:
+            ValueError: If strict=True and dimensions don't match
         """
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
@@ -783,15 +795,16 @@ class FeatureSurgeryPipeline:
             )
             return True
 
-        # Validate with SAE loader
+        # Validate with SAE loader - use strict mode by default to prevent corrupted models
         return self._surgery.attribution_computer.sae_loader.validate_model_compatibility(
-            hidden_dim, strict=False
+            hidden_dim, strict=strict
         )
 
     def run(
         self,
         output_path: str = None,
         dry_run: bool = False,
+        skip_validation: bool = False,
     ) -> dict:
         """
         Run the full surgery pipeline.
@@ -799,12 +812,22 @@ class FeatureSurgeryPipeline:
         Args:
             output_path: Path to save modified model (None = don't save)
             dry_run: If True, compute stats but don't modify weights
+            skip_validation: If True, skip SAE compatibility validation
 
         Returns:
             Surgery statistics
+
+        Raises:
+            ValueError: If SAE dimensions don't match model (unless skip_validation=True)
         """
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        # Validate SAE compatibility before surgery to prevent architecture corruption
+        if not skip_validation and not dry_run:
+            logger.info("Validating SAE-model compatibility...")
+            self.validate_sae_compatibility(strict=True)
+            logger.info("SAE-model compatibility validated successfully")
 
         logger.info(f"Running feature surgery ({'dry run' if dry_run else 'applying changes'})")
 
@@ -813,31 +836,64 @@ class FeatureSurgeryPipeline:
 
         # Save if requested
         if output_path and not dry_run:
-            self.save(output_path, stats)
+            self.save(output_path, stats, source_model_path=self._source_model_path)
 
         return stats
 
-    def save(self, output_path: str, stats: dict = None):
+    def save(self, output_path: str, stats: dict = None, source_model_path: str = None):
         """
-        Save the modified model and config.
+        Save the modified model and config, preserving architecture integrity.
 
         Args:
             output_path: Directory to save to
             stats: Optional stats to include in metadata
+            source_model_path: Original model path to copy config files from (optional)
+
+        Raises:
+            RuntimeError: If saved model fails architecture verification
         """
+        import shutil
+
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"Saving model to {output_path}")
 
+        # Clean model config to ensure JSON serialization works (fixes FP8/Mistral3 models)
+        clean_model_config_for_save(self.model)
+
         # Save model and tokenizer
-        self.model.save_pretrained(output_path)
+        self.model.save_pretrained(output_path, safe_serialization=True)
         self.tokenizer.save_pretrained(output_path)
 
-        # Save config
+        # Essential config files that should be preserved for correct architecture
+        essential_configs = [
+            "generation_config.json",
+            "preprocessor_config.json",
+            "special_tokens_map.json",
+        ]
+
+        # If we know the source model path, copy any missing essential configs
+        if source_model_path:
+            source_path = Path(source_model_path)
+            for config_file in essential_configs:
+                source_config = source_path / config_file
+                dest_config = output_path / config_file
+                if source_config.exists() and not dest_config.exists():
+                    logger.info(f"Copying {config_file} from source model")
+                    shutil.copy2(source_config, dest_config)
+
+            # Preserve original model config fields that transformers might not save
+            from src.abliterate import preserve_model_config
+            preserve_model_config(source_path, output_path)
+
+        # Verify architecture was preserved correctly
+        self._verify_saved_architecture(output_path)
+
+        # Save surgery config
         config_path = output_path / "feature_surgery_config.json"
         with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(self.config.to_dict(), f, indent=2)
+            json.dump(make_json_serializable(self.config.to_dict()), f, indent=2)
 
         # Save stats if provided
         if stats:
@@ -849,9 +905,70 @@ class FeatureSurgeryPipeline:
             }
             serializable_stats["num_features"] = len(self.config.features)
             with open(stats_path, "w", encoding="utf-8") as f:
-                json.dump(serializable_stats, f, indent=2)
+                json.dump(make_json_serializable(serializable_stats), f, indent=2)
 
         logger.info(f"Saved model and config to {output_path}")
+
+    def _verify_saved_architecture(self, output_path: Path):
+        """
+        Verify that the saved model has correct architecture configuration.
+
+        Args:
+            output_path: Path to the saved model
+
+        Raises:
+            RuntimeError: If architecture verification fails
+        """
+        config_path = output_path / "config.json"
+        if not config_path.exists():
+            raise RuntimeError(f"Model config.json not found at {output_path}")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            saved_config = json.load(f)
+
+        # Verify essential architecture fields are present
+        original_config = self.model.config.to_dict()
+
+        # Check critical architecture fields
+        critical_fields = [
+            "architectures",
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "vocab_size",
+        ]
+
+        # For models with text_config (multimodal), check nested fields
+        if "text_config" in original_config:
+            for field in critical_fields:
+                if field in original_config.get("text_config", {}):
+                    saved_value = saved_config.get("text_config", {}).get(field)
+                    original_value = original_config["text_config"].get(field)
+                    if saved_value != original_value:
+                        raise RuntimeError(
+                            f"Architecture mismatch in text_config.{field}: "
+                            f"saved={saved_value}, expected={original_value}"
+                        )
+        else:
+            for field in critical_fields:
+                if field in original_config:
+                    saved_value = saved_config.get(field)
+                    original_value = original_config.get(field)
+                    if saved_value != original_value:
+                        raise RuntimeError(
+                            f"Architecture mismatch in {field}: "
+                            f"saved={saved_value}, expected={original_value}"
+                        )
+
+        # Verify model weights file exists
+        weight_files = list(output_path.glob("*.safetensors")) + list(output_path.glob("*.bin"))
+        if not weight_files:
+            # Check for sharded models
+            index_files = list(output_path.glob("*.index.json"))
+            if not index_files:
+                raise RuntimeError(f"No model weight files found at {output_path}")
+
+        logger.info("Architecture verification passed")
 
     def export_config(self, path: str):
         """
@@ -861,7 +978,7 @@ class FeatureSurgeryPipeline:
             path: Path to save config JSON
         """
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.config.to_dict(), f, indent=2)
+            json.dump(make_json_serializable(self.config.to_dict()), f, indent=2)
         logger.info(f"Exported config to {path}")
 
 
@@ -870,7 +987,7 @@ def weaken_feature(
     layer: int,
     feature_id: int,
     strength: float = 0.3,
-    sae_repo: str = "google/gemma-scope-2-12b-it",
+    sae_repo: str = "google/gemma-scope-2-4b-it",
     **kwargs,
 ) -> dict:
     """
@@ -901,7 +1018,7 @@ def strengthen_feature(
     layer: int,
     feature_id: int,
     strength: float = 1.5,
-    sae_repo: str = "google/gemma-scope-2-12b-it",
+    sae_repo: str = "google/gemma-scope-2-4b-it",
     **kwargs,
 ) -> dict:
     """

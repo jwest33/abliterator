@@ -103,6 +103,10 @@ class ResidualExtractor:
             # VL models: model.model.model.layers
             if hasattr(self.model.model.model, "layers"):
                 return self.model.model.model.layers
+        # Mistral3 VL: model.model.language_model.layers
+        if hasattr(self.model, "model") and hasattr(self.model.model, "language_model"):
+            if hasattr(self.model.model.language_model, "layers"):
+                return self.model.model.language_model.layers
         if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
             return self.model.transformer.h  # GPT-2 style
         if hasattr(self.model, "gpt_neox") and hasattr(self.model.gpt_neox, "layers"):
@@ -262,18 +266,25 @@ class RefusalCalibrator:
 
     def generate_response(self, prompt: str) -> str:
         """Generate a response for the prompt."""
+        from transformers import GenerationConfig
+
         formatted = self.format_prompt(prompt)
 
         inputs = self.tokenizer(
             formatted, return_tensors="pt", truncation=True
         ).to(self.model.device)
 
+        # Use GenerationConfig to avoid warnings about mixing config and kwargs
+        gen_config = GenerationConfig(
+            max_new_tokens=self.config.max_new_tokens,
+            do_sample=False,  # Greedy for reproducibility
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=self.config.max_new_tokens,
-                do_sample=False,  # Greedy for reproducibility
-                pad_token_id=self.tokenizer.pad_token_id,
+                generation_config=gen_config,
             )
 
         # Decode only the new tokens

@@ -104,7 +104,7 @@ class AggregateStats:
 
 def load_results(filepath: str) -> dict:
     """Load JSON results file."""
-    with open(filepath, "r") as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
