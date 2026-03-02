@@ -57,6 +57,18 @@ DEFAULT_SETTINGS = {
     "intervention_range": [0.25, 0.95],
     # Dynamic layer targeting
     "dynamic_layer_targeting": False,
+    # KL divergence monitoring
+    "use_kl_monitoring": False,
+    "kl_reference_prompts_path": None,
+    "kl_num_reference_prompts": 50,
+    "kl_top_k": 200,
+    "kl_batch_size": 4,
+    "use_kl_auto_tune": False,
+    "kl_threshold": 0.5,
+    "kl_search_min": 0.1,
+    "kl_search_max": 2.0,
+    "kl_search_tolerance": 0.01,
+    "kl_max_search_iterations": 15,
 }
 
 
@@ -455,6 +467,41 @@ def validate_config_settings(settings: dict) -> tuple[bool, list[str]]:
     if "dtype" in settings:
         if settings["dtype"] not in ("float16", "bfloat16", "float32"):
             errors.append("dtype must be 'float16', 'bfloat16', or 'float32'")
+
+    # Validate KL monitoring fields
+    if "kl_threshold" in settings:
+        val = settings["kl_threshold"]
+        if not isinstance(val, (int, float)) or val <= 0:
+            errors.append("kl_threshold must be a positive number")
+
+    if "kl_top_k" in settings:
+        val = settings["kl_top_k"]
+        if not isinstance(val, int) or val < 1:
+            errors.append("kl_top_k must be a positive integer")
+
+    if "kl_num_reference_prompts" in settings:
+        val = settings["kl_num_reference_prompts"]
+        if not isinstance(val, int) or val < 1:
+            errors.append("kl_num_reference_prompts must be a positive integer")
+
+    if "kl_search_min" in settings and "kl_search_max" in settings:
+        smin = settings["kl_search_min"]
+        smax = settings["kl_search_max"]
+        if isinstance(smin, (int, float)) and isinstance(smax, (int, float)):
+            if smin >= smax:
+                errors.append("kl_search_min must be less than kl_search_max")
+            if smin < 0:
+                errors.append("kl_search_min must be non-negative")
+
+    if "kl_search_tolerance" in settings:
+        val = settings["kl_search_tolerance"]
+        if not isinstance(val, (int, float)) or val <= 0:
+            errors.append("kl_search_tolerance must be a positive number")
+
+    if "kl_max_search_iterations" in settings:
+        val = settings["kl_max_search_iterations"]
+        if not isinstance(val, int) or val < 1:
+            errors.append("kl_max_search_iterations must be a positive integer")
 
     return len(errors) == 0, errors
 

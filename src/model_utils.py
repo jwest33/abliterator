@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 # VL architecture patterns - maps model_type to known architecture class names
 VL_ARCHITECTURES = {
+    "qwen3_5": ["Qwen3_5ForConditionalGeneration"],
     "qwen3_vl": ["Qwen3VLForConditionalGeneration"],
     "qwen3_vl_moe": ["Qwen3VLMoeForConditionalGeneration"],
     "qwen2_vl": ["Qwen2VLForConditionalGeneration"],

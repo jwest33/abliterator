@@ -590,6 +590,15 @@ def run_abliteration(config: dict) -> bool:
                 unmapped_layer_behavior=config.get("unmapped_layer_behavior", "skip"),
                 # Dynamic layer targeting
                 dynamic_layer_targeting=config.get("dynamic_layer_targeting", False),
+                # KL monitoring
+                use_kl_monitoring=config.get("use_kl_monitoring", False),
+                kl_reference_prompts_path=config.get("kl_reference_prompts_path"),
+                kl_num_reference_prompts=config.get("kl_num_reference_prompts", 50),
+                kl_top_k=config.get("kl_top_k", 200),
+                use_kl_auto_tune=config.get("use_kl_auto_tune", False),
+                kl_threshold=config.get("kl_threshold", 0.5),
+                kl_search_min=config.get("kl_search_min", 0.1),
+                kl_search_max=config.get("kl_search_max", 2.0),
             )
 
             # Filter prompts if enabled
@@ -636,10 +645,73 @@ def run_abliteration(config: dict) -> bool:
                 )
             progress.advance(task, 10)
 
-            # Apply abliteration
-            progress.update(task, description="Applying abliteration to model weights...")
-            model = abliterate_model(model, directions, abl_config, null_space_projector)
-            progress.advance(task, 15)
+            # KL monitoring setup (cache reference logits BEFORE abliteration)
+            kl_monitor = None
+            kl_reference_prompts = None
+            auto_tune_result = None
+            kl_result = None
+
+            if abl_config.use_kl_monitoring or abl_config.use_kl_auto_tune:
+                progress.update(task, description="Caching reference logits for KL monitoring...")
+                from src.kl_monitor import (
+                    KLDivergenceMonitor,
+                    KLMonitorConfig,
+                    auto_tune_multiplier,
+                    load_reference_prompts,
+                    save_kl_report,
+                )
+
+                kl_reference_prompts = load_reference_prompts(
+                    path=abl_config.kl_reference_prompts_path,
+                    num_prompts=abl_config.kl_num_reference_prompts,
+                )
+                console.print(f"[{THEME['muted']}]Loaded {len(kl_reference_prompts)} reference prompts for KL monitoring[/{THEME['muted']}]")
+
+                kl_mon_config = KLMonitorConfig(
+                    num_reference_prompts=abl_config.kl_num_reference_prompts,
+                    top_k=abl_config.kl_top_k,
+                    batch_size=abl_config.kl_batch_size,
+                    search_min=abl_config.kl_search_min,
+                    search_max=abl_config.kl_search_max,
+                    search_tolerance=abl_config.kl_search_tolerance,
+                    max_search_iterations=abl_config.kl_max_search_iterations,
+                    kl_threshold=abl_config.kl_threshold,
+                )
+
+                kl_monitor = KLDivergenceMonitor(model, tokenizer, kl_mon_config, abl_config.device)
+                kl_monitor.cache_reference_logits(kl_reference_prompts)
+            progress.advance(task, 5)
+
+            # Apply abliteration (or auto-tune)
+            if abl_config.use_kl_auto_tune and kl_monitor is not None:
+                progress.update(task, description="Auto-tuning multiplier via KL binary search...")
+                auto_tune_result = auto_tune_multiplier(
+                    model=model,
+                    tokenizer=tokenizer,
+                    directions=directions,
+                    config=abl_config,
+                    kl_monitor=kl_monitor,
+                    kl_config=kl_mon_config,
+                    reference_prompts=kl_reference_prompts,
+                    null_space_projector=null_space_projector,
+                )
+                console.print(
+                    f"[{THEME['success']}]Auto-tune: multiplier={auto_tune_result.best_multiplier:.4f}, "
+                    f"KL={auto_tune_result.best_kl:.4f}, converged={auto_tune_result.converged}[/{THEME['success']}]"
+                )
+            else:
+                progress.update(task, description="Applying abliteration to model weights...")
+                model = abliterate_model(model, directions, abl_config, null_space_projector)
+            progress.advance(task, 10)
+
+            # KL monitoring (post-abliteration measurement for monitor-only mode)
+            if abl_config.use_kl_monitoring and kl_monitor is not None and auto_tune_result is None:
+                progress.update(task, description="Computing KL divergence...")
+                kl_result = kl_monitor.compute_kl_divergence(kl_reference_prompts, abl_config.direction_multiplier)
+                console.print(
+                    f"[{THEME['accent']}]KL divergence: mean={kl_result.mean_kl:.4f}, "
+                    f"median={kl_result.median_kl:.4f}, max={kl_result.max_kl:.4f}[/{THEME['accent']}]"
+                )
 
             # Save model (with version suffix if path already exists)
             progress.update(task, description="Saving abliterated model...")
@@ -670,9 +742,13 @@ def run_abliteration(config: dict) -> bool:
                 null_space_projector.save(str(output_path / "null_space_projectors.pt"))
 
             # Save config
+            effective_multiplier = (
+                auto_tune_result.best_multiplier if auto_tune_result is not None
+                else config["direction_multiplier"]
+            )
             config_save = {
                 "model_path": config["model_path"],
-                "direction_multiplier": config["direction_multiplier"],
+                "direction_multiplier": effective_multiplier,
                 "norm_preservation": config["norm_preservation"],
                 "num_harmful_prompts": len(abl_config.harmful_prompts),
                 "num_harmless_prompts": len(abl_config.harmless_prompts),
@@ -684,9 +760,25 @@ def run_abliteration(config: dict) -> bool:
                 "null_space_rank_ratio": config.get("null_space_rank_ratio"),
                 "use_adaptive_weighting": config.get("use_adaptive_weighting", False),
                 "dynamic_layer_targeting": config.get("dynamic_layer_targeting", False),
+                # KL monitoring
+                "use_kl_monitoring": config.get("use_kl_monitoring", False),
+                "use_kl_auto_tune": config.get("use_kl_auto_tune", False),
             }
+
+            if auto_tune_result is not None:
+                config_save["kl_auto_tune_result"] = {
+                    "best_multiplier": auto_tune_result.best_multiplier,
+                    "best_kl": auto_tune_result.best_kl,
+                    "converged": auto_tune_result.converged,
+                    "num_iterations": auto_tune_result.num_iterations,
+                }
+
             with open(output_path / "abliteration_config.json", "w", encoding="utf-8") as f:
                 json.dump(make_json_serializable(config_save), f, indent=2)
+
+            # Save KL divergence report
+            if kl_result is not None or auto_tune_result is not None:
+                save_kl_report(output_path, kl_result=kl_result, auto_tune_result=auto_tune_result)
 
             progress.advance(task, 10)
 
@@ -1141,9 +1233,12 @@ def run_gguf_export():
     # Build quantization choices based on available tools
     quant_choices = [
         questionary.Choice("Q4_K_M - 4-bit k-quant medium (recommended)", value="Q4_K_M"),
+        questionary.Choice("Q4_K_S - 4-bit k-quant small", value="Q4_K_S"),
         questionary.Choice("Q5_K_M - 5-bit k-quant medium (higher quality)", value="Q5_K_M"),
-        questionary.Choice("Q8_0 - 8-bit (near-lossless)", value="Q8_0"),
+        questionary.Choice("Q5_K_KM - 5-bit k-quant KM (enhanced quality)", value="Q5_K_KM"),
         questionary.Choice("Q6_K - 6-bit k-quant (good for larger models)", value="Q6_K"),
+        questionary.Choice("Q6_K_XL - 6-bit k-quant extra large (highest 6-bit)", value="Q6_K_XL"),
+        questionary.Choice("Q8_0 - 8-bit (near-lossless)", value="Q8_0"),
         questionary.Choice("Q3_K_M - 3-bit k-quant (aggressive compression)", value="Q3_K_M"),
         questionary.Choice("F16 - 16-bit float (no quantization)", value="F16"),
     ]
@@ -2523,13 +2618,24 @@ def main_menu():
 @click.option("--unmapped-layer-behavior", type=click.Choice(["skip", "default"]), default="skip", help="How to handle layers not in target map")
 # Dynamic layer targeting
 @click.option("--dynamic-layer-targeting/--no-dynamic-layer-targeting", default=False, help="Extract from ALL layers, apply per-layer directions and null-space projectors")
+# KL divergence monitoring
+@click.option("--kl-monitor/--no-kl-monitor", default=False, help="Report KL divergence after abliteration")
+@click.option("--kl-reference-prompts", type=str, default=None, help="Path to reference prompts for KL (default: preservation.txt)")
+@click.option("--kl-num-prompts", type=int, default=50, help="Number of reference prompts for KL")
+@click.option("--kl-top-k", type=int, default=200, help="Top-k tokens for KL approximation")
+@click.option("--kl-auto-tune/--no-kl-auto-tune", default=False, help="Binary search for best multiplier within KL budget")
+@click.option("--kl-threshold", type=float, default=0.5, help="Max mean KL divergence (nats) for auto-tune")
+@click.option("--kl-search-min", type=float, default=0.1, help="Auto-tune search range minimum")
+@click.option("--kl-search-max", type=float, default=2.0, help="Auto-tune search range maximum")
 def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
         no_norm_preservation, no_filter_prompts, device, dtype,
         winsorize, winsorize_percentile, null_space, preservation_prompts,
         null_space_rank_ratio, adaptive_weighting,
         projected, biprojection, per_neuron_norm, target_layers, harmless_boundary,
         harmless_clamp_ratio, num_measurement_layers, intervention_start, intervention_end,
-        layer_target_map, unmapped_layer_behavior, dynamic_layer_targeting):
+        layer_target_map, unmapped_layer_behavior, dynamic_layer_targeting,
+        kl_monitor, kl_reference_prompts, kl_num_prompts, kl_top_k,
+        kl_auto_tune, kl_threshold, kl_search_min, kl_search_max):
     """
     Abliteration Toolkit - Remove refusal behavior from language models.
 
@@ -2555,6 +2661,12 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
       --per-neuron-norm        Per-neuron norm preservation instead of Frobenius
       --target-layers          Only ablate specific layer types (e.g., 'o_proj,down_proj')
       --harmless-boundary      Clamp ablation to preserve harmless direction
+
+    KL divergence monitoring (capability drift):
+    \b
+      --kl-monitor             Report KL divergence after abliteration
+      --kl-auto-tune           Binary search for best multiplier within KL budget
+      --kl-threshold FLOAT     Max mean KL divergence for auto-tune (default: 0.5)
     """
     if batch:
         if not model_path:
@@ -2636,6 +2748,15 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
             "unmapped_layer_behavior": unmapped_layer_behavior,
             # Dynamic layer targeting
             "dynamic_layer_targeting": dynamic_layer_targeting,
+            # KL divergence monitoring
+            "use_kl_monitoring": kl_monitor,
+            "kl_reference_prompts_path": kl_reference_prompts,
+            "kl_num_reference_prompts": kl_num_prompts,
+            "kl_top_k": kl_top_k,
+            "use_kl_auto_tune": kl_auto_tune,
+            "kl_threshold": kl_threshold,
+            "kl_search_min": kl_search_min,
+            "kl_search_max": kl_search_max,
         }
 
         display_banner()

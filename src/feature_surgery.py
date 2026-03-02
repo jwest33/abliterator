@@ -863,7 +863,7 @@ class FeatureSurgeryPipeline:
         clean_model_config_for_save(self.model)
 
         # Save model and tokenizer
-        self.model.save_pretrained(output_path, safe_serialization=True)
+        self.model.save_pretrained(output_path, safe_serialization=True, max_shard_size="5GB")
         self.tokenizer.save_pretrained(output_path)
 
         # Essential config files that should be preserved for correct architecture

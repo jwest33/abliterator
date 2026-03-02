@@ -82,7 +82,9 @@ QUANT_TYPES = {
     "F16": "16-bit float, no quantization (largest, best quality)",
     "F32": "32-bit float, no quantization (very large)",
     "Q8_0": "8-bit quantization (near-lossless)",
+    "Q6_K_XL": "6-bit k-quant extra large (highest 6-bit quality)",
     "Q6_K": "6-bit k-quant (good for larger models)",
+    "Q5_K_KM": "5-bit k-quant KM (enhanced 5-bit quality)",
     "Q5_K_M": "5-bit k-quant medium (solid middle ground)",
     "Q5_K_S": "5-bit k-quant small",
     "Q4_K_M": "4-bit k-quant medium (popular choice)",
@@ -93,7 +95,7 @@ QUANT_TYPES = {
 }
 
 # Types that require conversion first (to F16), then quantization
-QUANT_ONLY_TYPES = ["Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q3_K_M", "Q3_K_S", "Q2_K"]
+QUANT_ONLY_TYPES = ["Q8_0", "Q6_K_XL", "Q6_K", "Q5_K_KM", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q3_K_M", "Q3_K_S", "Q2_K"]
 
 
 def _has_vision_weights(model_path: Path) -> bool:

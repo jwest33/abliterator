@@ -383,7 +383,7 @@ def save_model_safe(model, tokenizer, output_path: Path, target_dtype: torch.dty
 
     # Try normal save, fall back to manual if it fails
     try:
-        model.save_pretrained(output_path, safe_serialization=True)
+        model.save_pretrained(output_path, safe_serialization=True, max_shard_size="5GB")
         tokenizer.save_pretrained(output_path)
     except (NotImplementedError, RuntimeError) as e:
         error_msg = str(e)
@@ -392,7 +392,7 @@ def save_model_safe(model, tokenizer, output_path: Path, target_dtype: torch.dty
             # Clone tied weights to break sharing
             _untie_shared_weights(model)
             try:
-                model.save_pretrained(output_path, safe_serialization=True)
+                model.save_pretrained(output_path, safe_serialization=True, max_shard_size="5GB")
                 tokenizer.save_pretrained(output_path)
                 return
             except Exception as e2:
@@ -876,6 +876,21 @@ class AbliterationConfig:
     # Dynamic layer targeting: extract from ALL layers and apply per-layer directions/projectors
     dynamic_layer_targeting: bool = False  # When True: extract all layers, use per-layer directions
 
+    # KL divergence monitoring
+    use_kl_monitoring: bool = False
+    kl_reference_prompts_path: Optional[str] = None  # default: preservation.txt
+    kl_num_reference_prompts: int = 50
+    kl_top_k: int = 200
+    kl_batch_size: int = 4
+
+    # KL auto-tune (binary search over direction_multiplier)
+    use_kl_auto_tune: bool = False
+    kl_threshold: float = 0.5  # max mean KL (nats)
+    kl_search_min: float = 0.1
+    kl_search_max: float = 2.0
+    kl_search_tolerance: float = 0.01
+    kl_max_search_iterations: int = 15
+
 
 @dataclass
 class RefusalDirections:
@@ -943,7 +958,7 @@ class ActivationExtractor:
             # Structure: model.model.model.layers (VL wrapper -> multimodal -> text -> layers)
             if hasattr(self.model.model, "model") and hasattr(self.model.model.model, "layers"):
                 return self.model.model.model.layers
-            # VL MoE models and Mistral3 (Qwen3-VL-MoE, Qwen2-VL-MoE, Mistral3, etc.)
+            # VL MoE models, Mistral3, Qwen3.5 (Qwen3-VL-MoE, Qwen2-VL-MoE, Mistral3, Qwen3_5, etc.)
             # Structure: model.model.language_model.layers
             if hasattr(self.model.model, "language_model") and hasattr(self.model.model.language_model, "layers"):
                 return self.model.model.language_model.layers
@@ -2099,12 +2114,85 @@ def apply_per_neuron_norm_preserving_projection(
 # Model Abliteration
 
 
+def _get_language_model_root(model: AutoModelForCausalLM) -> tuple[torch.nn.Module, str]:
+    """
+    Find the language model root module for VL and standard architectures.
+
+    Returns (root_module, prefix) where prefix is the dotted path from the
+    top-level model to root_module. For standard text models, prefix may be ""
+    and root_module is the model itself.
+    """
+    # VL models: model.model.model.layers (Qwen2-VL, Qwen3-VL, LLaVA)
+    # Prefix is the dotted path as seen by model.named_modules() — NOT the
+    # Python attribute chain. E.g., model.model is named "model" in the iterator.
+    if hasattr(model, "model"):
+        if hasattr(model.model, "model") and hasattr(model.model.model, "layers"):
+            return model.model.model, "model.model"
+        # VL MoE / Mistral3 / Qwen3.5: model.model.language_model.layers
+        if hasattr(model.model, "language_model") and hasattr(model.model.language_model, "layers"):
+            return model.model.language_model, "model.language_model"
+        # Standard text models: model.model.layers
+        if hasattr(model.model, "layers"):
+            return model.model, "model"
+        if hasattr(model.model, "decoder") and hasattr(model.model.decoder, "layers"):
+            return model.model.decoder, "model.decoder"
+
+    # VL with language_model at top (InternVL, GLM4v)
+    if hasattr(model, "language_model"):
+        if hasattr(model.language_model, "model") and hasattr(model.language_model.model, "layers"):
+            return model.language_model.model, "language_model.model"
+        if hasattr(model.language_model, "transformer") and hasattr(model.language_model.transformer, "layers"):
+            return model.language_model.transformer, "language_model.transformer"
+        if hasattr(model.language_model, "layers"):
+            return model.language_model, "language_model"
+
+    # GPT-2 / GPT-NeoX / backbone / encoder / direct
+    if hasattr(model, "transformer"):
+        return model.transformer, "transformer"
+    if hasattr(model, "gpt_neox"):
+        return model.gpt_neox, "gpt_neox"
+    if hasattr(model, "backbone"):
+        return model.backbone, "backbone"
+    if hasattr(model, "encoder"):
+        return model.encoder, "encoder"
+
+    # Fallback: entire model
+    return model, ""
+
+
 def get_linear_layer_names(model: AutoModelForCausalLM) -> list[str]:
-    """Get names of all linear layers in the model."""
+    """
+    Get names of all linear layers in the language model.
+
+    For VL models, only returns layers within the language model submodule
+    (excluding vision encoder, projector, etc.) plus lm_head if present.
+    Names are full dotted paths from the top-level model so that getattr
+    traversal works.
+    """
+    root, prefix = _get_language_model_root(model)
+
     linear_names = []
-    for name, module in model.named_modules():
+    for name, module in root.named_modules():
         if isinstance(module, torch.nn.Linear):
-            linear_names.append(name)
+            full_name = f"{prefix}.{name}" if prefix else name
+            linear_names.append(full_name)
+
+    # Also include lm_head if it exists at the top level and wasn't already found
+    # (lm_head is often a sibling of the language model root, not inside it)
+    lm_head_candidates = ["lm_head", "model.lm_head", "model.model.lm_head"]
+    found_names = set(linear_names)
+    for lm_name in lm_head_candidates:
+        if lm_name not in found_names:
+            parts = lm_name.split(".")
+            try:
+                m = model
+                for part in parts:
+                    m = getattr(m, part)
+                if isinstance(m, torch.nn.Linear):
+                    linear_names.append(lm_name)
+            except AttributeError:
+                pass
+
     return linear_names
 
 
@@ -2148,6 +2236,8 @@ def get_layer_type_from_name(name: str) -> Optional[str]:
         "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
         "gate_proj", "up_proj", "down_proj",      # MLP
         "qkv_proj", "out_proj",                   # Alternative naming
+        "in_proj_a", "in_proj_b",                 # Hybrid linear attention (Qwen3.5 SSM)
+        "in_proj_qkv", "in_proj_z",              # Hybrid linear attention (Qwen3.5 SSM)
         "fc1", "fc2",                             # GPT-style MLP
         "c_attn", "c_proj",                       # GPT-2 naming
         "w1", "w2", "w3",                         # MoE expert layers (Mixtral/GptOss)
@@ -2757,8 +2847,65 @@ def run_abliteration(config: AbliterationConfig):
             null_space_projector.save(str(projector_path))
             logger.info(f"Saved null-space projectors to {projector_path}")
 
-    # Apply abliteration
-    model = abliterate_model(model, directions, config, null_space_projector)
+    # KL monitoring setup (must cache BEFORE abliteration modifies weights in-place)
+    kl_monitor = None
+    kl_reference_prompts = None
+    auto_tune_result = None
+    kl_result = None
+
+    if config.use_kl_monitoring or config.use_kl_auto_tune:
+        from src.kl_monitor import (
+            KLDivergenceMonitor,
+            KLMonitorConfig,
+            auto_tune_multiplier,
+            load_reference_prompts,
+            save_kl_report,
+        )
+
+        kl_reference_prompts = load_reference_prompts(
+            path=config.kl_reference_prompts_path,
+            num_prompts=config.kl_num_reference_prompts,
+        )
+        logger.info(f"Loaded {len(kl_reference_prompts)} reference prompts for KL monitoring")
+
+        kl_mon_config = KLMonitorConfig(
+            num_reference_prompts=config.kl_num_reference_prompts,
+            top_k=config.kl_top_k,
+            batch_size=config.kl_batch_size,
+            search_min=config.kl_search_min,
+            search_max=config.kl_search_max,
+            search_tolerance=config.kl_search_tolerance,
+            max_search_iterations=config.kl_max_search_iterations,
+            kl_threshold=config.kl_threshold,
+        )
+
+        kl_monitor = KLDivergenceMonitor(model, tokenizer, kl_mon_config, config.device)
+        kl_monitor.cache_reference_logits(kl_reference_prompts)
+
+    # Apply abliteration (or auto-tune)
+    if config.use_kl_auto_tune and kl_monitor is not None:
+        logger.info("Starting KL auto-tune binary search...")
+        auto_tune_result = auto_tune_multiplier(
+            model=model,
+            tokenizer=tokenizer,
+            directions=directions,
+            config=config,
+            kl_monitor=kl_monitor,
+            kl_config=kl_mon_config,
+            reference_prompts=kl_reference_prompts,
+            null_space_projector=null_space_projector,
+        )
+        logger.info(f"Auto-tune complete: best_multiplier={auto_tune_result.best_multiplier:.4f}, "
+                     f"KL={auto_tune_result.best_kl:.4f}, converged={auto_tune_result.converged}")
+    else:
+        model = abliterate_model(model, directions, config, null_space_projector)
+
+    # KL monitoring (post-abliteration measurement for monitor-only mode)
+    if config.use_kl_monitoring and kl_monitor is not None and auto_tune_result is None:
+        logger.info("Computing KL divergence on reference prompts...")
+        kl_result = kl_monitor.compute_kl_divergence(kl_reference_prompts, config.direction_multiplier)
+        logger.info(f"KL divergence: mean={kl_result.mean_kl:.4f}, median={kl_result.median_kl:.4f}, "
+                     f"max={kl_result.max_kl:.4f}, std={kl_result.std_kl:.4f}")
 
     # Save the modified model (with version suffix if path already exists)
     output_path = get_versioned_path(config.output_path)
@@ -2857,9 +3004,29 @@ def run_abliteration(config: AbliterationConfig):
         "num_layers_with_multipliers": len(config.per_layer_multipliers) if config.per_layer_multipliers else None,
         # Dynamic layer targeting
         "dynamic_layer_targeting": config.dynamic_layer_targeting,
+        # KL monitoring
+        "use_kl_monitoring": config.use_kl_monitoring,
+        "use_kl_auto_tune": config.use_kl_auto_tune,
+        "kl_threshold": config.kl_threshold if config.use_kl_auto_tune else None,
+        "kl_top_k": config.kl_top_k if (config.use_kl_monitoring or config.use_kl_auto_tune) else None,
+        "kl_num_reference_prompts": config.kl_num_reference_prompts if (config.use_kl_monitoring or config.use_kl_auto_tune) else None,
     }
+
+    # Add auto-tune result to config if available
+    if auto_tune_result is not None:
+        config_save["kl_auto_tune_result"] = {
+            "best_multiplier": auto_tune_result.best_multiplier,
+            "best_kl": auto_tune_result.best_kl,
+            "converged": auto_tune_result.converged,
+            "num_iterations": auto_tune_result.num_iterations,
+        }
+
     with open(output_path / "abliteration_config.json", "w", encoding="utf-8") as f:
         json.dump(make_json_serializable(config_save), f, indent=2)
+
+    # Save KL divergence report if monitoring was active
+    if kl_result is not None or auto_tune_result is not None:
+        save_kl_report(output_path, kl_result=kl_result, auto_tune_result=auto_tune_result)
 
     logger.info("=" * 60)
     logger.info("Abliteration complete!")
