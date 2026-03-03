@@ -191,6 +191,18 @@ def get_abliteration_config() -> Optional[dict]:
         return None
     config["model_path"] = model_path
 
+    # Detect architecture immediately after model selection
+    from src.abliterate import detect_hybrid_architecture
+    hybrid_info = detect_hybrid_architecture(model_path)
+
+    if hybrid_info.is_hybrid:
+        console.print(f"\n[bold {THEME['success']}]Hybrid architecture detected[/bold {THEME['success']}]")
+        console.print(
+            f"  {len(hybrid_info.full_attention_indices)} full attention + "
+            f"{len(hybrid_info.linear_attention_indices)} linear attention layers "
+            f"(every {hybrid_info.full_attention_interval}th layer is full attention)"
+        )
+
     # Output path
     console.print(f"\n[bold {THEME['primary']}]Step 2: Output Path[/bold {THEME['primary']}]\n")
     output_dir = get_default_output_dir()
@@ -272,14 +284,8 @@ def get_abliteration_config() -> Optional[dict]:
     # Step 4: Advanced Options
     console.print(f"\n[bold {THEME['primary']}]Step 4: Advanced Options[/bold {THEME['primary']}]\n")
 
-    use_advanced = questionary.confirm(
-        "Configure advanced options? (Winsorization, null-space, biprojection)",
-        default=False,
-        style=custom_style,
-    ).ask()
-
-    # Set defaults
-    config["use_projected_refusal"] = True  # Orthogonalize refusal against harmless (recommended, on by default)
+    # Set defaults for all advanced options
+    config["use_projected_refusal"] = True
     config["use_winsorization"] = False
     config["use_null_space"] = False
     config["use_adaptive_weighting"] = False
@@ -291,7 +297,96 @@ def get_abliteration_config() -> Optional[dict]:
     config["num_measurement_layers"] = 2
     config["intervention_range"] = (0.25, 0.95)
     config["dynamic_layer_targeting"] = False
+    config["hybrid_strategy"] = "auto"
+    config["hybrid_full_attn_weight"] = 1.0
+    config["hybrid_linear_attn_weight"] = 0.4
+    config["hybrid_skip_recurrent_proj"] = True
+    config["hybrid_skip_state_proj"] = False
 
+    # Build preset choices based on detected architecture
+    preset_choices = []
+    if hybrid_info.is_hybrid:
+        preset_choices.append(questionary.Choice(
+            "Recommended for hybrid model (hybrid-aware + null-space + winsorization)",
+            value="hybrid_recommended",
+        ))
+        preset_choices.append(questionary.Choice(
+            "Hybrid + biprojection (best NatInt preservation for hybrid models)",
+            value="hybrid_biprojection",
+        ))
+
+    preset_choices.extend([
+        questionary.Choice("Baseline (no advanced options)", value="baseline"),
+        questionary.Choice("Recommended standard (winsorize + null-space)", value="standard_recommended"),
+        questionary.Choice("Custom (configure each option manually)", value="custom"),
+    ])
+
+    preset = questionary.select(
+        "Select configuration preset:",
+        choices=preset_choices,
+        style=custom_style,
+    ).ask()
+
+    if preset == "hybrid_recommended":
+        config["use_winsorization"] = True
+        config["winsorize_percentile"] = 0.995
+        config["use_null_space"] = True
+        config["hybrid_strategy"] = "auto"
+        config["hybrid_skip_recurrent_proj"] = True
+        config["hybrid_skip_state_proj"] = False
+
+    elif preset == "hybrid_biprojection":
+        config["use_winsorization"] = True
+        config["winsorize_percentile"] = 0.995
+        config["use_null_space"] = True
+        config["hybrid_strategy"] = "auto"
+        config["hybrid_skip_recurrent_proj"] = True
+        config["hybrid_skip_state_proj"] = False
+        config["use_biprojection"] = True
+        config["use_per_neuron_norm"] = True
+        config["target_layer_types"] = ["o_proj", "down_proj"]
+        config["use_harmless_boundary"] = True
+        config["harmless_clamp_ratio"] = 0.1
+
+    elif preset == "standard_recommended":
+        config["use_winsorization"] = True
+        config["winsorize_percentile"] = 0.995
+        config["use_null_space"] = True
+        if hybrid_info.is_hybrid:
+            config["hybrid_strategy"] = "auto"
+            config["hybrid_skip_recurrent_proj"] = True
+
+    # For presets that enable null-space, prompt for rank ratio
+    if preset in ("hybrid_recommended", "hybrid_biprojection", "standard_recommended"):
+        config["null_space_rank_ratio"] = float(questionary.text(
+            "Null-space SVD rank ratio (0.1-0.99, lower = more aggressive):",
+            default="0.95",
+            style=custom_style,
+        ).ask())
+
+        # Print summary
+        console.print(f"\n[{THEME['success']}]Applied preset settings:[/{THEME['success']}]")
+        console.print(f"[{THEME['muted']}]  → Winsorization enabled (0.995)[/{THEME['muted']}]")
+        console.print(f"[{THEME['muted']}]  → Null-space constraints enabled (rank ratio {config['null_space_rank_ratio']})[/{THEME['muted']}]")
+        if config.get("hybrid_strategy") == "auto" and hybrid_info.is_hybrid:
+            console.print(f"[{THEME['muted']}]  → Hybrid-aware extraction (full attn + pre-full-attn layers)[/{THEME['muted']}]")
+            console.print(f"[{THEME['muted']}]  → Full attention layers: {config['hybrid_full_attn_weight']}x weight[/{THEME['muted']}]")
+            console.print(f"[{THEME['muted']}]  → Linear attention layers: {config['hybrid_linear_attn_weight']}x weight[/{THEME['muted']}]")
+            console.print(f"[{THEME['muted']}]  → Skipping in_proj_a, in_proj_b (recurrent dynamics)[/{THEME['muted']}]")
+        if config.get("use_biprojection"):
+            console.print(f"[{THEME['muted']}]  → Biprojection with per-neuron norm[/{THEME['muted']}]")
+            console.print(f"[{THEME['muted']}]  → Targeting o_proj, down_proj only[/{THEME['muted']}]")
+            console.print(f"[{THEME['muted']}]  → Harmless boundary clamping ({config['harmless_clamp_ratio']})[/{THEME['muted']}]")
+
+    elif preset == "baseline":
+        if hybrid_info.is_hybrid:
+            config["hybrid_strategy"] = "auto"
+            config["hybrid_skip_recurrent_proj"] = True
+            console.print(f"\n[{THEME['muted']}]Baseline with hybrid-aware mode auto-enabled[/{THEME['muted']}]")
+        else:
+            console.print(f"\n[{THEME['muted']}]Using baseline settings (no advanced options)[/{THEME['muted']}]")
+
+    use_advanced = preset == "custom"
     if use_advanced:
         # Winsorization (recommended for Gemma models)
         config["use_winsorization"] = questionary.confirm(
@@ -413,6 +508,61 @@ def get_abliteration_config() -> Optional[dict]:
                 except Exception as e:
                     display_error(f"Failed to load target map: {e}")
                     return None
+
+        # Hybrid architecture options (uses hybrid_info detected at model selection)
+        console.print(f"\n[bold {THEME['secondary']}]Hybrid Architecture (Qwen3.5, etc.)[/bold {THEME['secondary']}]")
+
+        if hybrid_info.is_hybrid:
+            config["hybrid_strategy"] = questionary.select(
+                "Hybrid architecture strategy:",
+                choices=[
+                    questionary.Choice("Auto (recommended - architecture-aware extraction & weighting)", value="auto"),
+                    questionary.Choice("Uniform (treat all layers the same, legacy behavior)", value="uniform"),
+                ],
+                default="auto",
+                style=custom_style,
+            ).ask()
+
+            if config["hybrid_strategy"] == "auto":
+                configure_hybrid = questionary.confirm(
+                    "Configure hybrid weights? (defaults: full_attn=1.0, linear_attn=0.4)",
+                    default=False,
+                    style=custom_style,
+                ).ask()
+
+                if configure_hybrid:
+                    config["hybrid_full_attn_weight"] = float(questionary.text(
+                        "Full attention layer weight (0.0-2.0):",
+                        default="1.0",
+                        style=custom_style,
+                    ).ask())
+
+                    config["hybrid_linear_attn_weight"] = float(questionary.text(
+                        "Linear attention layer weight (0.0-1.0):",
+                        default="0.4",
+                        style=custom_style,
+                    ).ask())
+
+                config["hybrid_skip_recurrent_proj"] = questionary.confirm(
+                    "Skip recurrent dynamics projections (in_proj_a, in_proj_b)? (recommended)",
+                    default=True,
+                    style=custom_style,
+                ).ask()
+
+                config["hybrid_skip_state_proj"] = questionary.confirm(
+                    "Also skip state projections (in_proj_qkv, in_proj_z)? (more conservative)",
+                    default=False,
+                    style=custom_style,
+                ).ask()
+
+                console.print(f"[{THEME['muted']}]  → Full attention layers weighted at {config['hybrid_full_attn_weight']}x[/{THEME['muted']}]")
+                console.print(f"[{THEME['muted']}]  → Linear attention layers weighted at {config['hybrid_linear_attn_weight']}x[/{THEME['muted']}]")
+                if config["hybrid_skip_recurrent_proj"]:
+                    console.print(f"[{THEME['muted']}]  → Skipping in_proj_a, in_proj_b (recurrent dynamics)[/{THEME['muted']}]")
+                if config["hybrid_skip_state_proj"]:
+                    console.print(f"[{THEME['muted']}]  → Skipping in_proj_qkv, in_proj_z (state projections)[/{THEME['muted']}]")
+        else:
+            console.print(f"[{THEME['muted']}]No hybrid architecture detected (standard model)[/{THEME['muted']}]")
 
         # Biprojection options
         console.print(f"\n[bold {THEME['secondary']}]Biprojection (improved NatInt preservation)[/bold {THEME['secondary']}]")
@@ -590,6 +740,12 @@ def run_abliteration(config: dict) -> bool:
                 unmapped_layer_behavior=config.get("unmapped_layer_behavior", "skip"),
                 # Dynamic layer targeting
                 dynamic_layer_targeting=config.get("dynamic_layer_targeting", False),
+                # Hybrid architecture
+                hybrid_strategy=config.get("hybrid_strategy", "auto"),
+                hybrid_full_attn_weight=config.get("hybrid_full_attn_weight", 1.0),
+                hybrid_linear_attn_weight=config.get("hybrid_linear_attn_weight", 0.4),
+                hybrid_skip_recurrent_proj=config.get("hybrid_skip_recurrent_proj", True),
+                hybrid_skip_state_proj=config.get("hybrid_skip_state_proj", False),
                 # KL monitoring
                 use_kl_monitoring=config.get("use_kl_monitoring", False),
                 kl_reference_prompts_path=config.get("kl_reference_prompts_path"),
@@ -2618,6 +2774,12 @@ def main_menu():
 @click.option("--unmapped-layer-behavior", type=click.Choice(["skip", "default"]), default="skip", help="How to handle layers not in target map")
 # Dynamic layer targeting
 @click.option("--dynamic-layer-targeting/--no-dynamic-layer-targeting", default=False, help="Extract from ALL layers, apply per-layer directions and null-space projectors")
+# Hybrid architecture
+@click.option("--hybrid-strategy", type=click.Choice(["auto", "uniform"]), default="auto", help="Hybrid architecture strategy: auto (recommended) or uniform (legacy)")
+@click.option("--hybrid-full-attn-weight", type=float, default=1.0, help="Ablation weight for full attention layers (0.0-2.0)")
+@click.option("--hybrid-linear-attn-weight", type=float, default=0.4, help="Ablation weight for linear attention layers (0.0-1.0)")
+@click.option("--hybrid-skip-recurrent/--no-hybrid-skip-recurrent", default=True, help="Skip in_proj_a/in_proj_b (recurrent dynamics) during ablation")
+@click.option("--hybrid-skip-state/--no-hybrid-skip-state", default=False, help="Also skip in_proj_qkv/in_proj_z (more conservative)")
 # KL divergence monitoring
 @click.option("--kl-monitor/--no-kl-monitor", default=False, help="Report KL divergence after abliteration")
 @click.option("--kl-reference-prompts", type=str, default=None, help="Path to reference prompts for KL (default: preservation.txt)")
@@ -2634,6 +2796,8 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
         projected, biprojection, per_neuron_norm, target_layers, harmless_boundary,
         harmless_clamp_ratio, num_measurement_layers, intervention_start, intervention_end,
         layer_target_map, unmapped_layer_behavior, dynamic_layer_targeting,
+        hybrid_strategy, hybrid_full_attn_weight, hybrid_linear_attn_weight,
+        hybrid_skip_recurrent, hybrid_skip_state,
         kl_monitor, kl_reference_prompts, kl_num_prompts, kl_top_k,
         kl_auto_tune, kl_threshold, kl_search_min, kl_search_max):
     """
@@ -2661,6 +2825,13 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
       --per-neuron-norm        Per-neuron norm preservation instead of Frobenius
       --target-layers          Only ablate specific layer types (e.g., 'o_proj,down_proj')
       --harmless-boundary      Clamp ablation to preserve harmless direction
+
+    Hybrid architecture (Qwen3.5, etc.):
+    \b
+      --hybrid-strategy        auto (detect+apply, default) or uniform (legacy)
+      --hybrid-full-attn-weight   Ablation weight for full attention layers (default: 1.0)
+      --hybrid-linear-attn-weight Ablation weight for linear attention layers (default: 0.4)
+      --hybrid-skip-recurrent  Skip in_proj_a/in_proj_b during ablation (default: on)
 
     KL divergence monitoring (capability drift):
     \b
@@ -2748,6 +2919,12 @@ def cli(batch, model_path, output_path, num_prompts, direction_multiplier,
             "unmapped_layer_behavior": unmapped_layer_behavior,
             # Dynamic layer targeting
             "dynamic_layer_targeting": dynamic_layer_targeting,
+            # Hybrid architecture
+            "hybrid_strategy": hybrid_strategy,
+            "hybrid_full_attn_weight": hybrid_full_attn_weight,
+            "hybrid_linear_attn_weight": hybrid_linear_attn_weight,
+            "hybrid_skip_recurrent_proj": hybrid_skip_recurrent,
+            "hybrid_skip_state_proj": hybrid_skip_state,
             # KL divergence monitoring
             "use_kl_monitoring": kl_monitor,
             "kl_reference_prompts_path": kl_reference_prompts,

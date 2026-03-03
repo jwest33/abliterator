@@ -876,6 +876,13 @@ class AbliterationConfig:
     # Dynamic layer targeting: extract from ALL layers and apply per-layer directions/projectors
     dynamic_layer_targeting: bool = False  # When True: extract all layers, use per-layer directions
 
+    # Hybrid architecture strategy (Qwen3.5, etc.)
+    hybrid_strategy: str = "auto"  # "auto" (detect+apply), "uniform" (current behavior)
+    hybrid_full_attn_weight: float = 1.0  # Ablation multiplier for full attention layers
+    hybrid_linear_attn_weight: float = 0.4  # Ablation multiplier for linear attention layers
+    hybrid_skip_recurrent_proj: bool = True  # Skip in_proj_a, in_proj_b during ablation
+    hybrid_skip_state_proj: bool = False  # Also skip in_proj_qkv, in_proj_z (more conservative)
+
     # KL divergence monitoring
     use_kl_monitoring: bool = False
     kl_reference_prompts_path: Optional[str] = None  # default: preservation.txt
@@ -932,6 +939,109 @@ class RefusalDirections:
             quality_scores=data.get("quality_scores"),
             biprojected_direction=data.get("biprojected_direction"),
         )
+
+
+# Hybrid Architecture Detection
+
+
+@dataclass
+class HybridArchitectureInfo:
+    """Information about hybrid attention architectures (e.g., Qwen3.5)."""
+
+    is_hybrid: bool
+    layer_types: list[str]  # "full_attention" or "linear_attention" per layer
+    full_attention_indices: list[int]
+    linear_attention_indices: list[int]
+    full_attention_interval: int  # e.g. 4 for Qwen3.5 (every 4th layer is full attention)
+
+
+def detect_hybrid_architecture(model_path: str) -> HybridArchitectureInfo:
+    """
+    Detect hybrid attention architecture from model config.json.
+
+    Reads layer_types from config.json to identify models with mixed
+    full attention and linear attention layers (e.g., Qwen3.5 with
+    GatedDeltaNet linear attention).
+
+    Args:
+        model_path: Path to model directory containing config.json
+
+    Returns:
+        HybridArchitectureInfo with detected architecture details.
+        Returns is_hybrid=False if no hybrid architecture detected.
+    """
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return HybridArchitectureInfo(
+            is_hybrid=False, layer_types=[], full_attention_indices=[],
+            linear_attention_indices=[], full_attention_interval=0,
+        )
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return HybridArchitectureInfo(
+            is_hybrid=False, layer_types=[], full_attention_indices=[],
+            linear_attention_indices=[], full_attention_interval=0,
+        )
+
+    # Look for layer_types in text_config (VL models) or top-level
+    layer_types_raw = None
+    if "text_config" in config and "layer_types" in config["text_config"]:
+        layer_types_raw = config["text_config"]["layer_types"]
+    elif "layer_types" in config:
+        layer_types_raw = config["layer_types"]
+
+    if not layer_types_raw or not isinstance(layer_types_raw, list):
+        return HybridArchitectureInfo(
+            is_hybrid=False, layer_types=[], full_attention_indices=[],
+            linear_attention_indices=[], full_attention_interval=0,
+        )
+
+    # Normalize layer type names
+    # Common patterns: "full_attention"/"sliding_window"/"global" vs "linear_attention"/"gated_deltanet"
+    layer_types = []
+    full_indices = []
+    linear_indices = []
+
+    full_attn_names = {"full_attention", "sliding_window", "global", "sdpa"}
+    linear_attn_names = {"linear_attention", "gated_deltanet", "linear"}
+
+    for i, lt in enumerate(layer_types_raw):
+        lt_lower = lt.lower().strip()
+        if lt_lower in full_attn_names:
+            layer_types.append("full_attention")
+            full_indices.append(i)
+        elif lt_lower in linear_attn_names:
+            layer_types.append("linear_attention")
+            linear_indices.append(i)
+        else:
+            # Unknown type - treat as linear attention (conservative)
+            layer_types.append("linear_attention")
+            linear_indices.append(i)
+            logger.warning(f"Unknown layer type '{lt}' at index {i}, treating as linear_attention")
+
+    # Check if it's actually hybrid (has both types)
+    is_hybrid = len(full_indices) > 0 and len(linear_indices) > 0
+
+    # Compute interval (distance between full attention layers)
+    interval = 0
+    if len(full_indices) >= 2:
+        intervals = [full_indices[i + 1] - full_indices[i] for i in range(len(full_indices) - 1)]
+        # Use the most common interval
+        from collections import Counter
+        interval = Counter(intervals).most_common(1)[0][0]
+    elif len(full_indices) == 1:
+        interval = len(layer_types_raw)  # Only one full attention layer
+
+    return HybridArchitectureInfo(
+        is_hybrid=is_hybrid,
+        layer_types=layer_types,
+        full_attention_indices=full_indices,
+        linear_attention_indices=linear_indices,
+        full_attention_interval=interval,
+    )
 
 
 # Activation Extraction
@@ -1564,6 +1674,7 @@ def orthogonalize_against_harmless(
 def compute_direction_quality_scores(
     harmful_activations: dict[int, torch.Tensor],
     harmless_activations: dict[int, torch.Tensor],
+    hybrid_info: Optional["HybridArchitectureInfo"] = None,
 ) -> dict[int, dict[str, float]]:
     """
     Compute SNR-based quality scores for refusal directions at each layer.
@@ -1571,9 +1682,10 @@ def compute_direction_quality_scores(
     Args:
         harmful_activations: Per-layer harmful prompt activations {layer_idx: tensor}
         harmless_activations: Per-layer harmless prompt activations {layer_idx: tensor}
+        hybrid_info: Optional hybrid architecture info for layer type metadata
 
     Returns:
-        Dict mapping layer_idx -> {snr, cos_sim, quality, refusal_norm, harmful_norm, harmless_norm}
+        Dict mapping layer_idx -> {snr, cos_sim, quality, refusal_norm, harmful_norm, harmless_norm, layer_type}
     """
     quality_scores = {}
 
@@ -1587,7 +1699,7 @@ def compute_direction_quality_scores(
         harmful_mean = harmful.mean(dim=0)
         harmless_mean = harmless.mean(dim=0)
 
-        # Compute norms 
+        # Compute norms
         harmful_norm = harmful_mean.norm().item()
         harmless_norm = harmless_mean.norm().item()
 
@@ -1606,6 +1718,11 @@ def compute_direction_quality_scores(
 
         quality = snr * (1 - cos_sim)
 
+        # Determine layer type from hybrid info
+        layer_type = "unknown"
+        if hybrid_info and hybrid_info.is_hybrid and layer_idx < len(hybrid_info.layer_types):
+            layer_type = hybrid_info.layer_types[layer_idx]
+
         quality_scores[layer_idx] = {
             "snr": snr,
             "cos_sim": cos_sim,
@@ -1613,10 +1730,12 @@ def compute_direction_quality_scores(
             "refusal_norm": refusal_norm,
             "harmful_norm": harmful_norm,
             "harmless_norm": harmless_norm,
+            "layer_type": layer_type,
         }
 
         logger.debug(
             f"Layer {layer_idx}: SNR={snr:.3f}, cos_sim={cos_sim:.3f}, quality={quality:.3f}"
+            + (f", type={layer_type}" if layer_type != "unknown" else "")
         )
 
     return quality_scores
@@ -1687,10 +1806,26 @@ def compute_refusal_directions(
     layers = extractor._get_layers()
     num_layers = len(layers)
 
+    # Detect hybrid architecture for extraction strategy
+    hybrid_info = getattr(config, "_hybrid_info", None)
+
     if config.dynamic_layer_targeting:
         # Dynamic layer targeting: extract from ALL layers
         extraction_layers = list(range(num_layers))
         logger.info(f"Dynamic layer targeting enabled: extracting from all {num_layers} layers")
+    elif hybrid_info and hybrid_info.is_hybrid and config.hybrid_strategy == "auto" and config.extraction_layer_indices is None:
+        # Hybrid-aware extraction: all full attention layers + the linear attention layer before each
+        extraction_layers = []
+        for fa_idx in hybrid_info.full_attention_indices:
+            if fa_idx - 1 >= 0 and fa_idx - 1 not in extraction_layers:
+                extraction_layers.append(fa_idx - 1)
+            extraction_layers.append(fa_idx)
+        extraction_layers.sort()
+        logger.info(
+            f"Hybrid-aware extraction: {len(extraction_layers)} layers "
+            f"({len(hybrid_info.full_attention_indices)} full attn + "
+            f"{len(extraction_layers) - len(hybrid_info.full_attention_indices)} pre-full-attn linear)"
+        )
     elif config.extraction_layer_indices is None:
         # Default: extract from middle-to-later layers
         extraction_layers = list(range(num_layers // 4, 3 * num_layers // 4))
@@ -1813,6 +1948,7 @@ def compute_refusal_directions(
         quality_scores = compute_direction_quality_scores(
             harmful_activations,
             harmless_activations,
+            hybrid_info=hybrid_info,
         )
         # Log top quality layers
         if quality_scores:
@@ -2304,6 +2440,9 @@ def abliterate_model(
     Returns:
         Modified model
     """
+    # Get hybrid architecture info
+    hybrid_info = getattr(config, "_hybrid_info", None)
+
     # Log mode
     mode_parts = []
     if config.use_biprojection:
@@ -2314,6 +2453,8 @@ def abliterate_model(
         mode_parts.append("null-space")
     if config.use_harmless_boundary:
         mode_parts.append("harmless boundary")
+    if hybrid_info and hybrid_info.is_hybrid and config.hybrid_strategy == "auto":
+        mode_parts.append("hybrid-aware")
 
     if mode_parts:
         logger.info(f"Applying abliteration with: {', '.join(mode_parts)}")
@@ -2411,6 +2552,20 @@ def abliterate_model(
                 skipped_count += 1
                 continue
 
+        # Hybrid architecture: skip recurrent dynamics projections
+        if hybrid_info and hybrid_info.is_hybrid and config.hybrid_strategy == "auto":
+            layer_type = get_layer_type_from_name(name)
+
+            # Skip recurrent dynamics projections (tiny matrices that control gating)
+            if config.hybrid_skip_recurrent_proj and layer_type in ("in_proj_a", "in_proj_b"):
+                skipped_count += 1
+                continue
+
+            # Optionally skip state projections too (more conservative)
+            if config.hybrid_skip_state_proj and layer_type in ("in_proj_qkv", "in_proj_z"):
+                skipped_count += 1
+                continue
+
         # Get direction (biprojected > per-layer > mean fallback)
         if primary_direction is not None:
             direction = primary_direction
@@ -2459,6 +2614,13 @@ def abliterate_model(
             if effective_multiplier == 0.0:
                 skipped_count += 1
                 continue
+
+        # Hybrid architecture: apply differentiated layer weighting
+        if hybrid_info and hybrid_info.is_hybrid and config.hybrid_strategy == "auto" and layer_idx is not None:
+            if layer_idx in hybrid_info.full_attention_indices:
+                effective_multiplier *= config.hybrid_full_attn_weight
+            elif layer_idx in hybrid_info.linear_attention_indices:
+                effective_multiplier *= config.hybrid_linear_attn_weight
 
         # Apply projection based on mode
         try:
@@ -2717,6 +2879,17 @@ def filter_harmful_prompts_by_refusal(
 
 def run_abliteration(config: AbliterationConfig):
     """Run the complete abliteration pipeline."""
+    # Detect hybrid architecture early
+    hybrid_info = detect_hybrid_architecture(config.model_path)
+    if hybrid_info.is_hybrid:
+        logger.info(
+            f"Hybrid architecture detected: {len(hybrid_info.full_attention_indices)} full attention, "
+            f"{len(hybrid_info.linear_attention_indices)} linear attention layers "
+            f"(interval: {hybrid_info.full_attention_interval})"
+        )
+    # Store hybrid_info in config for downstream access
+    config._hybrid_info = hybrid_info
+
     # Dynamic layer targeting implies per-layer directions
     if config.dynamic_layer_targeting:
         config.use_mean_direction = False
@@ -2724,6 +2897,8 @@ def run_abliteration(config: AbliterationConfig):
 
     logger.info("=" * 60)
     features = ["Norm-Preserving Abliteration"]
+    if hybrid_info.is_hybrid and config.hybrid_strategy == "auto":
+        features.append("Hybrid-Aware")
     if config.dynamic_layer_targeting:
         features.append("Dynamic Layer Targeting")
     if config.use_biprojection:

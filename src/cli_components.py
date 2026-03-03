@@ -809,6 +809,14 @@ def display_training_config_details(config: dict, title: str = "Config Details")
         ("intervention_range", "Intervention Range"),
     ]
 
+    hybrid_settings = [
+        ("hybrid_strategy", "Hybrid Strategy"),
+        ("hybrid_full_attn_weight", "Full Attn Weight"),
+        ("hybrid_linear_attn_weight", "Linear Attn Weight"),
+        ("hybrid_skip_recurrent_proj", "Skip Recurrent Proj"),
+        ("hybrid_skip_state_proj", "Skip State Proj"),
+    ]
+
     def format_value(value):
         """Format a setting value for display."""
         if isinstance(value, bool):
@@ -861,6 +869,20 @@ def display_training_config_details(config: dict, title: str = "Config Details")
         settings_table.add_row("", "")
         settings_table.add_row("[bold]Advanced Options[/bold]", "")
         for key, label in advanced_settings:
+            if key in settings:
+                settings_table.add_row(f"  {label}", format_value(settings[key]))
+
+    # Add hybrid settings (only if strategy is not "auto" default, or if non-default weights)
+    hybrid_enabled = (
+        settings.get("hybrid_strategy", "auto") != "auto"
+        or settings.get("hybrid_full_attn_weight", 1.0) != 1.0
+        or settings.get("hybrid_linear_attn_weight", 0.4) != 0.4
+        or settings.get("hybrid_skip_state_proj", False)
+    )
+    if hybrid_enabled:
+        settings_table.add_row("", "")
+        settings_table.add_row("[bold]Hybrid Architecture[/bold]", "")
+        for key, label in hybrid_settings:
             if key in settings:
                 settings_table.add_row(f"  {label}", format_value(settings[key]))
 

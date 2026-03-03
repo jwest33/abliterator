@@ -57,6 +57,12 @@ DEFAULT_SETTINGS = {
     "intervention_range": [0.25, 0.95],
     # Dynamic layer targeting
     "dynamic_layer_targeting": False,
+    # Hybrid architecture
+    "hybrid_strategy": "auto",
+    "hybrid_full_attn_weight": 1.0,
+    "hybrid_linear_attn_weight": 0.4,
+    "hybrid_skip_recurrent_proj": True,
+    "hybrid_skip_state_proj": False,
     # KL divergence monitoring
     "use_kl_monitoring": False,
     "kl_reference_prompts_path": None,
