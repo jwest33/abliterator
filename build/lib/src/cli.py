@@ -914,12 +914,12 @@ def run_jlens_map_generation(
         out_dir = Path(output_path)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        console.print(f"[{THEME['primary']}]Loading harmful prompts...[/{THEME['primary']}]")
+        console.print(f"[{THEME['info']}]Loading harmful prompts...[/{THEME['info']}]")
         prompts = load_prompts_from_file(
             get_default_prompts_path("harmful.txt"), num_prompts=num_prompts
         )
 
-        console.print(f"[{THEME['primary']}]Loading model {model_path}...[/{THEME['primary']}]")
+        console.print(f"[{THEME['info']}]Loading model {model_path}...[/{THEME['info']}]")
         model, tokenizer = load_model_and_tokenizer(
             model_path, device=device, dtype=torch_dtype, trust_remote_code=True
         )
@@ -939,8 +939,8 @@ def run_jlens_map_generation(
         )
 
         console.print(
-            f"[{THEME['primary']}]Computing J-lens vectors "
-            f"({len(jlens_config.concepts)} concepts, {len(prompts)} prompts)...[/{THEME['primary']}]"
+            f"[{THEME['info']}]Computing J-lens vectors "
+            f"({len(jlens_config.concepts)} concepts, {len(prompts)} prompts)...[/{THEME['info']}]"
         )
         jlens = compute_jlens_vectors(model, tokenizer, prompts, jlens_config)
 
