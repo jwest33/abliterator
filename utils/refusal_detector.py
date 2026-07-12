@@ -66,14 +66,24 @@ class LogLikelihoodRefusalDetector:
         Format prompt with chat template for generation context.
 
         Applies the model's chat template with add_generation_prompt=True
-        so the model is in "responding" mode. Falls back to the raw prompt
-        for base LMs with no chat template set.
+        so the model is in "responding" mode. Passes enable_thinking=False
+        for reasoning-mode models (Qwen3.5, DeepSeek-R1) so the anchor is
+        measured at the actual refusal position rather than inside a
+        thinking block. Falls back to the plain call for tokenizers that
+        don't accept the kwarg, and to the raw prompt for base LMs with
+        no chat template set.
         """
         if getattr(self.tokenizer, "chat_template", None):
             messages = [{"role": "user", "content": prompt}]
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
         return prompt
 
     def get_log_prob(

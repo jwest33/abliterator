@@ -35,7 +35,12 @@ from src.abliterate import (
     get_linear_layer_names,
     load_prompts_from_file,
 )
-from src.jlens import DEFAULT_REFUSAL_CONCEPTS
+from src.jlens import (
+    DEFAULT_REFUSAL_CONCEPTS,
+    build_jspace_config_dict,
+    mine_refusal_concepts,
+    save_jspace_config_json,
+)
 from src.kl_monitor import KLDivergenceMonitor, KLMonitorConfig, WeightSnapshot
 from src.model_utils import load_model_and_tokenizer
 from utils.refusal_detector import LogLikelihoodRefusalDetector, RefusalDetectorConfig
@@ -74,6 +79,18 @@ class JLensIterativeConfig:
     jlens_grad_checkpoint: bool = False
     jlens_basis_rank: int = 16
     jlens_min_projection_ratio: float = 0.1
+
+    # Concept mining (recomputed each iteration to catch refusal-style shifts)
+    # mining_mode: "consensus" (mode-based; recommended, ignores harmless) or
+    #              "contrast" (mean P(harmful) - mean P(harmless))
+    mine_concepts_each_iteration: bool = False
+    mine_top_k: int = 8
+    mine_min_specificity: float = 0.005
+    mine_batch_size: int = 4
+    mine_max_seq_len: int = 128
+    mine_num_prompts: int = 64
+    mining_mode: str = "consensus"
+    mine_num_positions: int = 4
 
     # Base abliteration passthroughs
     use_projected_refusal: bool = True
@@ -145,6 +162,8 @@ def _build_abliteration_config(
     harmful_prompts: list[str],
     harmless_prompts: list[str],
     step_multiplier: float,
+    concepts: Optional[list[str]] = None,
+    concept_token_ids: Optional[dict] = None,
 ) -> AbliterationConfig:
     """Assemble an AbliterationConfig with J-lens restriction enabled for one iteration step."""
     return AbliterationConfig(
@@ -172,7 +191,8 @@ def _build_abliteration_config(
         jlens_batch_size=it_cfg.jlens_batch_size,
         jlens_max_seq_len=it_cfg.jlens_max_seq_len,
         jlens_grad_checkpoint=it_cfg.jlens_grad_checkpoint,
-        jlens_concepts=list(it_cfg.jlens_concepts),
+        jlens_concepts=list(concepts) if concepts else list(it_cfg.jlens_concepts),
+        jlens_concept_token_ids=concept_token_ids,
     )
 
 
@@ -275,6 +295,11 @@ def run_jlens_iterative_abliteration(
             final_kl=0.0,
         )
 
+    # Persist the last-successful mined concepts so we can fall back if a later
+    # iteration collapses (e.g. model stops refusing enough for mining to work).
+    last_mined_concepts: Optional[list[str]] = None
+    last_mined_ids: Optional[dict[str, int]] = None
+
     for it in range(1, config.max_iterations + 1):
         logger.info(f"===== Iteration {it}/{config.max_iterations} =====")
 
@@ -282,9 +307,44 @@ def run_jlens_iterative_abliteration(
         linear_names = get_linear_layer_names(model)
         step_snapshot = WeightSnapshot(model, linear_names)
 
+        # Optional contrastive concept mining on the CURRENT model state
+        step_concepts: Optional[list[str]] = None
+        step_concept_ids: Optional[dict[str, int]] = None
+        if config.mine_concepts_each_iteration:
+            try:
+                mined = mine_refusal_concepts(
+                    model, tokenizer,
+                    harmful_prompts=harmful_prompts[: config.mine_num_prompts],
+                    harmless_prompts=(
+                        harmless_prompts[: config.mine_num_prompts]
+                        if config.mining_mode == "contrast" else None
+                    ),
+                    top_k=config.mine_top_k,
+                    min_specificity=config.mine_min_specificity,
+                    batch_size=config.mine_batch_size,
+                    max_seq_len=config.mine_max_seq_len,
+                    device=config.device,
+                    mode=config.mining_mode,
+                    num_positions=config.mine_num_positions,
+                )
+            except Exception as e:
+                logger.warning(f"Concept mining failed: {e}; using previous / default")
+                mined = []
+            if mined:
+                step_concepts = [m.concept for m in mined]
+                step_concept_ids = {m.concept: m.token_id for m in mined}
+                last_mined_concepts = step_concepts
+                last_mined_ids = step_concept_ids
+            elif last_mined_concepts:
+                logger.info("Mining collapsed; reusing last successful mined concepts")
+                step_concepts = last_mined_concepts
+                step_concept_ids = last_mined_ids
+            # else: falls through to config.jlens_concepts (defaults)
+
         # Build config for this step (fresh J-lens computation via inline path)
         abl_cfg = _build_abliteration_config(
-            config, model_path, output_path, harmful_prompts, harmless_prompts, step
+            config, model_path, output_path, harmful_prompts, harmless_prompts, step,
+            concepts=step_concepts, concept_token_ids=step_concept_ids,
         )
 
         try:
@@ -423,6 +483,80 @@ def run_jlens_iterative_abliteration(
             indent=2,
             default=str,
         )
+
+    # Write J-space-specific abliteration_config.json
+    dtype_str = {torch.float16: "float16", torch.bfloat16: "bfloat16",
+                 torch.float32: "float32"}.get(config.dtype, str(config.dtype))
+    concept_source = (
+        "auto-mine" if config.mine_concepts_each_iteration else "defaults"
+    )
+    mined_records = (
+        [{"concept": c, "token_id": tid}
+         for c, tid in (last_mined_ids or {}).items()]
+        if config.mine_concepts_each_iteration and last_mined_concepts else None
+    )
+    payload = build_jspace_config_dict(
+        mode="iterative",
+        model_path=model_path,
+        output_path=str(output_path),
+        device=config.device,
+        dtype=dtype_str,
+        jlens_params={
+            "num_prompts": config.jlens_num_prompts,
+            "batch_size": config.jlens_batch_size,
+            "max_seq_len": config.jlens_max_seq_len,
+            "grad_checkpoint": config.jlens_grad_checkpoint,
+            "basis_rank": config.jlens_basis_rank,
+            "min_projection_ratio": config.jlens_min_projection_ratio,
+        },
+        concepts_params={
+            "source": concept_source,
+            "concepts": last_mined_concepts if last_mined_concepts else list(config.jlens_concepts),
+            "mining_mode": config.mining_mode if config.mine_concepts_each_iteration else None,
+            "mining_top_k": config.mine_top_k if config.mine_concepts_each_iteration else None,
+            "mining_min_score": config.mine_min_specificity if config.mine_concepts_each_iteration else None,
+            "mining_num_positions": config.mine_num_positions if config.mine_concepts_each_iteration else None,
+            "mining_num_prompts": config.mine_num_prompts if config.mine_concepts_each_iteration else None,
+            "mine_each_iteration": config.mine_concepts_each_iteration,
+            "last_mined_concepts": mined_records,
+        },
+        abliteration_params={
+            "harmful_prompts_path": harmful_prompts_path,
+            "harmless_prompts_path": harmless_prompts_path,
+            "num_harmful_prompts": len(harmful_prompts),
+            "num_harmless_prompts": len(harmless_prompts),
+            "use_projected_refusal": config.use_projected_refusal,
+            "use_welford_mean": config.use_welford_mean,
+            "use_float64_subtraction": config.use_float64_subtraction,
+            "use_winsorization": config.use_winsorization,
+            "winsorize_percentile": config.winsorize_percentile if config.use_winsorization else None,
+            "norm_preservation": config.norm_preservation,
+        },
+        iterative_params={
+            "max_iterations": config.max_iterations,
+            "target_refusal_rate": config.target_refusal_rate,
+            "step_multiplier": config.step_multiplier,
+            "min_step_multiplier": config.min_step_multiplier,
+            "min_improvement": config.min_improvement,
+            "eval_prompt_count": config.eval_prompt_count,
+            "refusal_threshold": config.refusal_threshold,
+            "kl_guardrail": {
+                "enabled": config.use_kl_guardrail,
+                "threshold": config.kl_threshold if config.use_kl_guardrail else None,
+                "num_reference_prompts": config.kl_num_reference_prompts if config.use_kl_guardrail else None,
+                "top_k": config.kl_top_k if config.use_kl_guardrail else None,
+            },
+            "result": {
+                "converged": converged,
+                "reason": reason,
+                "baseline_refusal_rate": baseline_refusal,
+                "final_refusal_rate": prev_refusal,
+                "total_iterations": len(history),
+                "final_kl": final_kl,
+            },
+        },
+    )
+    save_jspace_config_json(payload, str(output_path))
 
     # Free memory
     del model, detector

@@ -873,6 +873,42 @@ def get_abliteration_config() -> Optional[dict]:
     return config
 
 
+def _display_mined_concepts(mined: list, mode: str = "consensus") -> None:
+    """Render mined refusal concepts as a Rich table for review.
+
+    In consensus mode, MinedConcept fields are reused as:
+      specificity -> score (coverage * mean_prob)
+      p_harmful   -> mean_prob across harmful prompts
+      p_harmless  -> coverage fraction across harmful prompts
+    """
+    from rich.table import Table
+    if mode == "consensus":
+        title = "Mined refusal concepts (consensus mode)"
+        score_col = "Score"
+        col_a, col_b = "Mean P(harmful)", "Coverage"
+    else:
+        title = "Mined refusal concepts (contrast mode)"
+        score_col = "Specificity"
+        col_a, col_b = "P(harmful)", "P(harmless)"
+    table = Table(title=title, show_lines=False)
+    table.add_column("#", style=THEME["muted"], justify="right")
+    table.add_column("Concept", style=THEME["accent"])
+    table.add_column("Token ID", style=THEME["muted"], justify="right")
+    table.add_column(score_col, style=THEME["primary"], justify="right")
+    table.add_column(col_a, justify="right")
+    table.add_column(col_b, justify="right")
+    for i, m in enumerate(mined, 1):
+        table.add_row(
+            str(i),
+            repr(m.concept),
+            str(m.token_id),
+            f"{m.specificity:.4f}",
+            f"{m.p_harmful:.4f}",
+            f"{m.p_harmless:.4f}",
+        )
+    console.print(table)
+
+
 def run_jlens_map_generation(
     model_path: str,
     output_path: str,
@@ -886,12 +922,21 @@ def run_jlens_map_generation(
     min_multiplier: float = 0.1,
     device: str = "cuda",
     dtype: str = "float16",
+    mine_concepts: bool = False,
+    mine_top_k: int = 8,
+    mine_min_specificity: float = 0.005,
+    mine_num_prompts: int = 64,
+    mining_mode: str = "consensus",
+    mine_num_positions: int = 4,
 ) -> bool:
     """Compute J-lens vectors for a model and write out layer_target_map.json.
 
     Uses harmful prompts from the standard prompts directory. Writes two files:
       - <output_path>/layer_target_map.json  (feeds --layer-target-map)
       - <output_path>/jlens_vectors.pt        (cache for --jlens-vectors)
+
+    If `mine_concepts` is True, the refusal concepts are discovered empirically
+    via contrastive next-token probs (harmful vs harmless) before running J-lens.
     """
     from src.abliterate import (
         get_transformer_layers,
@@ -901,8 +946,11 @@ def run_jlens_map_generation(
     from src.jlens import (
         DEFAULT_REFUSAL_CONCEPTS,
         JLensConfig,
+        build_jspace_config_dict,
         compute_jlens_vectors,
         generate_layer_target_map,
+        mine_refusal_concepts,
+        save_jspace_config_json,
         save_target_map_json,
     )
     from src.model_utils import load_model_and_tokenizer
@@ -914,16 +962,58 @@ def run_jlens_map_generation(
         out_dir = Path(output_path)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        console.print(f"[{THEME['info']}]Loading harmful prompts...[/{THEME['info']}]")
+        console.print(f"[{THEME['primary']}]Loading harmful prompts...[/{THEME['primary']}]")
         prompts = load_prompts_from_file(
-            get_default_prompts_path("harmful.txt"), num_prompts=num_prompts
+            get_default_prompts_path("harmful.txt"),
+            num_prompts=max(num_prompts, mine_num_prompts if mine_concepts else num_prompts),
         )
 
-        console.print(f"[{THEME['info']}]Loading model {model_path}...[/{THEME['info']}]")
+        console.print(f"[{THEME['primary']}]Loading model {model_path}...[/{THEME['primary']}]")
         model, tokenizer = load_model_and_tokenizer(
             model_path, device=device, dtype=torch_dtype, trust_remote_code=True
         )
         tokenizer.padding_side = "left"
+
+        concept_token_ids: Optional[dict[str, int]] = None
+        mined_records: list = []
+        if mine_concepts:
+            console.print(
+                f"[{THEME['primary']}]Mining refusal concepts "
+                f"(mode={mining_mode})...[/{THEME['primary']}]"
+            )
+            harmful_for_mining = prompts[:mine_num_prompts]
+            harmless_for_mining = None
+            if mining_mode == "contrast":
+                harmless_for_mining = load_prompts_from_file(
+                    get_default_prompts_path("harmless.txt"), num_prompts=mine_num_prompts
+                )
+            mined = mine_refusal_concepts(
+                model, tokenizer,
+                harmful_prompts=harmful_for_mining,
+                harmless_prompts=harmless_for_mining,
+                top_k=mine_top_k,
+                min_specificity=mine_min_specificity,
+                batch_size=max(batch_size, 4),
+                max_seq_len=max_seq_len,
+                device=device,
+                mode=mining_mode,
+                num_positions=mine_num_positions,
+            )
+            if mined:
+                concepts = [m.concept for m in mined]
+                concept_token_ids = {m.concept: m.token_id for m in mined}
+                mined_records = [
+                    {"concept": m.concept, "token_id": m.token_id,
+                     "score": m.specificity, "mean_prob": m.p_harmful,
+                     "coverage": m.p_harmless}
+                    for m in mined
+                ]
+                _display_mined_concepts(mined, mode=mining_mode)
+            else:
+                console.print(
+                    f"[{THEME['warning']}]Mining yielded no concepts; "
+                    f"falling back to defaults[/{THEME['warning']}]"
+                )
 
         jlens_config = JLensConfig(
             concepts=list(concepts) if concepts else list(DEFAULT_REFUSAL_CONCEPTS),
@@ -936,13 +1026,17 @@ def run_jlens_map_generation(
             basis_rank=basis_rank,
             exclude_threshold=exclude_threshold,
             min_multiplier=min_multiplier,
+            concept_token_ids=concept_token_ids,
         )
 
+        # Use the (possibly-truncated) jlens prompt slice, not the mining slice
+        jlens_prompts = prompts[:num_prompts]
+
         console.print(
-            f"[{THEME['info']}]Computing J-lens vectors "
-            f"({len(jlens_config.concepts)} concepts, {len(prompts)} prompts)...[/{THEME['info']}]"
+            f"[{THEME['primary']}]Computing J-lens vectors "
+            f"({len(jlens_config.concepts)} concepts, {len(jlens_prompts)} prompts)...[/{THEME['primary']}]"
         )
-        jlens = compute_jlens_vectors(model, tokenizer, prompts, jlens_config)
+        jlens = compute_jlens_vectors(model, tokenizer, jlens_prompts, jlens_config)
 
         num_layers = len(get_transformer_layers(model))
         target_map = generate_layer_target_map(
@@ -965,6 +1059,51 @@ def run_jlens_map_generation(
         vectors_path = str(out_dir / "jlens_vectors.pt")
         jlens.save(vectors_path)
 
+        # Assemble and write J-space abliteration_config.json
+        multipliers = target_map.get("layer_multipliers", {})
+        excluded = target_map.get("excluded_layers", [])
+        aggressive = target_map.get("aggressive_layers", [])
+        concept_source = (
+            "auto-mine" if mine_concepts
+            else ("manual" if concepts else "defaults")
+        )
+        payload = build_jspace_config_dict(
+            mode="map",
+            model_path=model_path,
+            output_path=str(out_dir),
+            device=device,
+            dtype=dtype,
+            jlens_params={
+                "num_prompts": num_prompts,
+                "batch_size": batch_size,
+                "max_seq_len": max_seq_len,
+                "grad_checkpoint": grad_checkpoint,
+                "basis_rank": basis_rank,
+                "vectors_path": vectors_path,
+            },
+            concepts_params={
+                "source": concept_source,
+                "concepts": jlens_config.concepts,
+                "concept_token_ids": concept_token_ids,
+                "mining_mode": mining_mode if mine_concepts else None,
+                "mining_top_k": mine_top_k if mine_concepts else None,
+                "mining_min_score": mine_min_specificity if mine_concepts else None,
+                "mining_num_positions": mine_num_positions if mine_concepts else None,
+                "mining_num_prompts": mine_num_prompts if mine_concepts else None,
+                "mined_concepts": mined_records if mine_concepts else None,
+            },
+            target_map_params={
+                "map_path": map_path,
+                "exclude_threshold": exclude_threshold,
+                "min_multiplier": min_multiplier,
+                "num_layers_total": num_layers,
+                "num_active_layers": len(multipliers),
+                "num_excluded_layers": len(excluded),
+                "num_aggressive_layers": len(aggressive),
+            },
+        )
+        save_jspace_config_json(payload, str(out_dir))
+
         # Free the model before returning
         del model
         gc.collect()
@@ -972,14 +1111,13 @@ def run_jlens_map_generation(
             torch.cuda.empty_cache()
 
         # Summary
-        excluded = target_map.get("excluded_layers", [])
-        multipliers = target_map.get("layer_multipliers", {})
         console.print(
             f"[{THEME['success']}]J-lens map generated: "
             f"{len(multipliers)} active layers, {len(excluded)} excluded[/{THEME['success']}]"
         )
         console.print(f"[{THEME['muted']}]  → {map_path}[/{THEME['muted']}]")
         console.print(f"[{THEME['muted']}]  → {vectors_path}[/{THEME['muted']}]")
+        console.print(f"[{THEME['muted']}]  → {out_dir / 'abliteration_config.json'}[/{THEME['muted']}]")
         return True
     except Exception as e:
         console.print(f"[red]J-lens map generation failed: {e}[/red]")
@@ -1007,6 +1145,11 @@ def run_jlens_iterative_mode(
     grad_checkpoint: bool = False,
     basis_rank: int = 16,
     min_projection_ratio: float = 0.1,
+    mine_concepts: bool = False,
+    mine_top_k: int = 8,
+    mine_min_specificity: float = 0.005,
+    mining_mode: str = "consensus",
+    mine_num_positions: int = 4,
 ) -> bool:
     """Run J-lens-guided iterative abliteration. Writes model + iteration_history.json."""
     from src.jlens import DEFAULT_REFUSAL_CONCEPTS
@@ -1031,6 +1174,11 @@ def run_jlens_iterative_mode(
             jlens_grad_checkpoint=grad_checkpoint,
             jlens_basis_rank=basis_rank,
             jlens_min_projection_ratio=min_projection_ratio,
+            mine_concepts_each_iteration=mine_concepts,
+            mine_top_k=mine_top_k,
+            mine_min_specificity=mine_min_specificity,
+            mining_mode=mining_mode,
+            mine_num_positions=mine_num_positions,
             device=device,
             dtype=torch_dtype,
         )
@@ -1147,15 +1295,83 @@ def run_jspace_workflow() -> None:
 
     # Shared J-lens extraction params
     console.print(f"\n[bold {THEME['primary']}]Step 3: J-lens Extraction[/bold {THEME['primary']}]\n")
-    concepts_raw = questionary.text(
-        "Refusal concepts (comma-separated, leave blank for defaults):",
-        default="",
+
+    concept_source = questionary.select(
+        "Where should refusal concepts come from?",
+        choices=[
+            questionary.Choice(
+                title="Auto-mine from this model's responses (recommended)",
+                value="mine",
+            ),
+            questionary.Choice(
+                title="Use built-in defaults (' cannot', ' sorry', ...)",
+                value="defaults",
+            ),
+            questionary.Choice(
+                title="Enter manually (comma-separated)",
+                value="manual",
+            ),
+        ],
+        default="mine",
         style=custom_style,
     ).ask()
-    concepts = (
-        [c.strip() for c in concepts_raw.split(",") if c.strip()]
-        if concepts_raw else None
-    )
+
+    concepts: Optional[list[str]] = None
+    mine_concepts_flag = False
+    mine_top_k = 8
+    mine_min_specificity = 0.005
+    mining_mode = "consensus"
+    mine_num_positions = 4
+    if concept_source == "mine":
+        mine_concepts_flag = True
+        mining_mode = questionary.select(
+            "Mining strategy:",
+            choices=[
+                questionary.Choice(
+                    title="Consensus — tokens the model uses across positions 0..N (recommended)",
+                    value="consensus",
+                ),
+                questionary.Choice(
+                    title="Contrast — P(t|harmful) - P(t|harmless)",
+                    value="contrast",
+                ),
+            ],
+            default="consensus",
+            style=custom_style,
+        ).ask()
+        if mining_mode == "consensus":
+            mine_num_positions = int(questionary.text(
+                "Number of response positions to walk (1=first token only, 4=captures 'I cannot help with'):",
+                default="4",
+                style=custom_style,
+            ).ask())
+        mine_top_k = int(questionary.text(
+            "Top-k concepts to keep from mining:",
+            default="8",
+            style=custom_style,
+        ).ask())
+        default_min_score = "0.005" if mining_mode == "contrast" else "0.001"
+        min_score_label = (
+            "Min score (coverage * mean-prob):" if mining_mode == "consensus"
+            else "Min specificity (P(t|harmful)-P(t|harmless)):"
+        )
+        mine_min_specificity = float(questionary.text(
+            min_score_label,
+            default=default_min_score,
+            style=custom_style,
+        ).ask())
+    elif concept_source == "manual":
+        concepts_raw = questionary.text(
+            "Refusal concepts (comma-separated):",
+            default="",
+            style=custom_style,
+        ).ask()
+        concepts = (
+            [c.strip() for c in concepts_raw.split(",") if c.strip()]
+            if concepts_raw else None
+        )
+    # else: defaults — leave concepts=None, mine_concepts_flag=False
+
     num_prompts = int(questionary.text(
         "Number of harmful prompts to average over:",
         default="32",
@@ -1196,6 +1412,10 @@ def run_jspace_workflow() -> None:
             style=custom_style,
         ).ask())
 
+        concept_source_label = (
+            f"auto-mine ({mining_mode}, top {mine_top_k}, min={mine_min_specificity})"
+            if mine_concepts_flag else (concepts or "default")
+        )
         summary = {
             "mode": "jlens-map",
             "model_path": model_path,
@@ -1209,7 +1429,7 @@ def run_jspace_workflow() -> None:
             "basis_rank": basis_rank,
             "exclude_threshold": exclude_threshold,
             "min_multiplier": min_multiplier,
-            "concepts": concepts or "default",
+            "concepts": concept_source_label,
         }
         display_config_panel(summary, "J-lens Map Generation")
         if not questionary.confirm("\nProceed?", default=True, style=custom_style).ask():
@@ -1227,6 +1447,11 @@ def run_jspace_workflow() -> None:
             min_multiplier=min_multiplier,
             device=device,
             dtype=dtype,
+            mine_concepts=mine_concepts_flag,
+            mine_top_k=mine_top_k,
+            mine_min_specificity=mine_min_specificity,
+            mining_mode=mining_mode,
+            mine_num_positions=mine_num_positions,
         )
 
     elif mode == "restrict":
@@ -1291,8 +1516,17 @@ def run_jspace_workflow() -> None:
             "jlens_max_seq_len": max_seq_len,
             "jlens_grad_checkpoint": grad_checkpoint,
             "jlens_concepts": concepts,
+            "mine_jlens_concepts": mine_concepts_flag,
+            "mine_top_k": mine_top_k,
+            "mine_min_specificity": mine_min_specificity,
+            "mining_mode": mining_mode,
+            "mine_num_positions": mine_num_positions,
         })
 
+        concept_source_label = (
+            f"auto-mine ({mining_mode}, top {mine_top_k}, min={mine_min_specificity})"
+            if mine_concepts_flag else (concepts or "default")
+        )
         display_config_panel(
             {
                 "mode": "jlens-restrict",
@@ -1310,13 +1544,55 @@ def run_jspace_workflow() -> None:
                 "jlens_batch_size": batch_size,
                 "jlens_max_seq_len": max_seq_len,
                 "jlens_grad_checkpoint": grad_checkpoint,
-                "jlens_concepts": concepts or "default",
+                "jlens_concepts": concept_source_label,
             },
             "J-space Restricted Abliteration",
         )
         if not questionary.confirm("\nProceed?", default=True, style=custom_style).ask():
             return
         run_abliteration(abl_config)
+
+        # Overwrite the default abliteration_config.json with a J-space-specific one.
+        # (run_abliteration mines its own concepts inside compute_refusal_directions,
+        # so we don't have direct access to the resulting concept list here — we
+        # record the intent + settings that produced them.)
+        try:
+            from src.jlens import build_jspace_config_dict as _build, save_jspace_config_json as _save
+            payload = _build(
+                mode="restrict",
+                model_path=model_path,
+                output_path=output_path,
+                device=device,
+                dtype=dtype,
+                jlens_params={
+                    "num_prompts": num_prompts,
+                    "batch_size": batch_size,
+                    "max_seq_len": max_seq_len,
+                    "grad_checkpoint": grad_checkpoint,
+                    "basis_rank": basis_rank,
+                    "min_projection_ratio": min_projection_ratio,
+                    "cached_vectors_path": cached_path,
+                },
+                concepts_params={
+                    "source": (
+                        "auto-mine" if mine_concepts_flag
+                        else ("manual" if concepts else "defaults")
+                    ),
+                    "concepts": concepts,
+                    "mining_mode": mining_mode if mine_concepts_flag else None,
+                    "mining_top_k": mine_top_k if mine_concepts_flag else None,
+                    "mining_min_score": mine_min_specificity if mine_concepts_flag else None,
+                    "mining_num_positions": mine_num_positions if mine_concepts_flag else None,
+                },
+                abliteration_params={
+                    "direction_multiplier": direction_multiplier,
+                    "num_prompts": abl_num_prompts,
+                    "use_winsorization": use_winsorize,
+                },
+            )
+            _save(payload, output_path)
+        except Exception as e:
+            console.print(f"[{THEME['warning']}]Could not write J-space config: {e}[/{THEME['warning']}]")
 
     else:  # iterative
         console.print(f"\n[bold {THEME['primary']}]Step 4: Iterative Loop Options[/bold {THEME['primary']}]\n")
@@ -1364,6 +1640,10 @@ def run_jspace_workflow() -> None:
                 style=custom_style,
             ).ask())
 
+        concept_source_label = (
+            f"auto-mine each iter ({mining_mode}, top {mine_top_k}, min={mine_min_specificity})"
+            if mine_concepts_flag else (concepts or "default")
+        )
         summary = {
             "mode": "jlens-iterative",
             "model_path": model_path,
@@ -1382,7 +1662,7 @@ def run_jspace_workflow() -> None:
             "grad_checkpoint": grad_checkpoint,
             "basis_rank": basis_rank,
             "min_projection_ratio": min_projection_ratio,
-            "concepts": concepts or "default",
+            "concepts": concept_source_label,
         }
         display_config_panel(summary, "J-lens Iterative Abliteration")
         if not questionary.confirm("\nProceed?", default=True, style=custom_style).ask():
@@ -1405,6 +1685,11 @@ def run_jspace_workflow() -> None:
             grad_checkpoint=grad_checkpoint,
             basis_rank=basis_rank,
             min_projection_ratio=min_projection_ratio,
+            mine_concepts=mine_concepts_flag,
+            mine_top_k=mine_top_k,
+            mine_min_specificity=mine_min_specificity,
+            mining_mode=mining_mode,
+            mine_num_positions=mine_num_positions,
         )
 
 
@@ -1531,6 +1816,12 @@ def run_abliteration(config: dict) -> bool:
                 jlens_max_seq_len=config.get("jlens_max_seq_len", 64),
                 jlens_grad_checkpoint=config.get("jlens_grad_checkpoint", False),
                 jlens_concepts=config.get("jlens_concepts"),
+                jlens_concept_token_ids=config.get("jlens_concept_token_ids"),
+                mine_jlens_concepts=config.get("mine_jlens_concepts", False),
+                mine_top_k=config.get("mine_top_k", 8),
+                mine_min_specificity=config.get("mine_min_specificity", 0.005),
+                mining_mode=config.get("mining_mode", "consensus"),
+                mine_num_positions=config.get("mine_num_positions", 4),
             )
 
             # Filter prompts if enabled
@@ -3837,6 +4128,11 @@ def main_menu():
 @click.option("--jlens-eval-prompt-count", type=int, default=50, help="Number of prompts to evaluate refusal rate per iteration (default: 50)")
 @click.option("--jlens-iter-kl-guardrail/--no-jlens-iter-kl-guardrail", default=False, help="Roll back an iteration if KL from original exceeds --jlens-iter-kl-threshold")
 @click.option("--jlens-iter-kl-threshold", type=float, default=0.5, help="KL nats threshold for --jlens-iter-kl-guardrail (default: 0.5)")
+# Contrastive concept mining (recommended: replaces the fixed refusal-concept list)
+@click.option("--jlens-mine-concepts/--no-jlens-mine-concepts", default=False, help="Auto-discover refusal concepts from the model's own next-token distribution (default: off; overrides --jlens-concepts when on)")
+@click.option("--jlens-mine-top-k", type=int, default=8, help="Number of mined concepts to keep (default: 8)")
+@click.option("--jlens-mine-min-specificity", type=float, default=0.005, help="Minimum score for a mined concept (default: 0.005; use ~0.001 for consensus mode)")
+@click.option("--jlens-mining-mode", type=click.Choice(["consensus", "contrast"]), default="consensus", help="Mining strategy: consensus (mode-based, recommended) or contrast (P(harmful)-P(harmless))")
 def cli(batch, jlens_map_mode, jlens_iterative_mode, model_path, output_path, num_prompts, direction_multiplier,
         no_norm_preservation, no_filter_prompts, device, dtype,
         winsorize, winsorize_percentile,
@@ -3857,7 +4153,8 @@ def cli(batch, jlens_map_mode, jlens_iterative_mode, model_path, output_path, nu
         jlens_concepts, jlens_num_prompts, jlens_batch_size, jlens_max_seq_len,
         jlens_grad_checkpoint, jlens_exclude_threshold, jlens_min_multiplier,
         jlens_max_iterations, jlens_target_refusal_rate, jlens_step_multiplier,
-        jlens_eval_prompt_count, jlens_iter_kl_guardrail, jlens_iter_kl_threshold):
+        jlens_eval_prompt_count, jlens_iter_kl_guardrail, jlens_iter_kl_threshold,
+        jlens_mine_concepts, jlens_mine_top_k, jlens_mine_min_specificity, jlens_mining_mode):
     """
     Abliteration Toolkit - Remove refusal behavior from language models.
 
@@ -3940,6 +4237,10 @@ def cli(batch, jlens_map_mode, jlens_iterative_mode, model_path, output_path, nu
             grad_checkpoint=jlens_grad_checkpoint,
             basis_rank=jlens_basis_rank,
             min_projection_ratio=jlens_min_projection_ratio,
+            mine_concepts=jlens_mine_concepts,
+            mine_top_k=jlens_mine_top_k,
+            mine_min_specificity=jlens_mine_min_specificity,
+            mining_mode=jlens_mining_mode,
         )
         sys.exit(0 if success else 1)
 
@@ -3968,6 +4269,10 @@ def cli(batch, jlens_map_mode, jlens_iterative_mode, model_path, output_path, nu
             min_multiplier=jlens_min_multiplier,
             device=device,
             dtype=effective_dtype,
+            mine_concepts=jlens_mine_concepts,
+            mine_top_k=jlens_mine_top_k,
+            mine_min_specificity=jlens_mine_min_specificity,
+            mining_mode=jlens_mining_mode,
         )
         sys.exit(0 if success else 1)
 
@@ -4091,6 +4396,11 @@ def cli(batch, jlens_map_mode, jlens_iterative_mode, model_path, output_path, nu
                 [c.strip() for c in jlens_concepts.split(",") if c.strip()]
                 if jlens_concepts else None
             ),
+            # Contrastive concept mining
+            "mine_jlens_concepts": jlens_mine_concepts,
+            "mine_top_k": jlens_mine_top_k,
+            "mine_min_specificity": jlens_mine_min_specificity,
+            "mining_mode": jlens_mining_mode,
         }
 
         display_banner()

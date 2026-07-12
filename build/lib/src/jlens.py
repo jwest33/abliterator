@@ -33,26 +33,390 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_REFUSAL_CONCEPTS = [
-     " cannot", 
-     " sorry", 
-     " apolog", 
-     " unable", 
-     " refuse", 
-     " won", 
-     " Unfortunately", 
-     " As", 
-     " dangerous", 
-     " harmful"
+    " cannot",
+    " can",
+    " sorry",
+    " apolog",
+    " unable",
+    " refuse",
+    "I",
 ]
-
 DEFAULT_CONTRAST_CONCEPTS = [
     " Sure",
     " Here",
     " Of",
     " Yes",
-    " Absolutely",
-    " Certainly"
 ]
+
+
+@dataclass
+class MinedConcept:
+    """Result of contrastive concept mining."""
+
+    concept: str            # Decoded token string (also used as dict key downstream)
+    token_id: int           # Vocabulary id (canonical — bypasses re-tokenization)
+    specificity: float      # mean P(t | harmful) - mean P(t | harmless)
+    p_harmful: float
+    p_harmless: float
+
+
+def _apply_chat_template_no_think(tokenizer, messages: list[dict]) -> str:
+    """Apply chat template with add_generation_prompt=True and thinking disabled.
+
+    Reasoning-mode models (Qwen3/Qwen3.5, DeepSeek-R1, etc.) inject a `<think>`
+    prefix by default, which pushes the model into a reasoning preamble instead
+    of directly emitting the refusal (or acceptance). Passing enable_thinking=False
+    forces the response to start at position 0.
+
+    Falls back to the plain call for tokenizers that don't accept the kwarg.
+    """
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+
+
+def _apply_chat_template_or_raw(tokenizer, prompts: list[str]) -> list[str]:
+    if getattr(tokenizer, "chat_template", None):
+        return [
+            _apply_chat_template_no_think(tokenizer, [{"role": "user", "content": p}])
+            for p in prompts
+        ]
+    return list(prompts)
+
+
+def _mean_next_token_probs(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompts: list[str],
+    batch_size: int,
+    max_seq_len: int,
+    device: str,
+) -> torch.Tensor:
+    """Average softmax(logits[:, -1, :]) across `prompts`. Returns [vocab] on CPU float32."""
+    acc: Optional[torch.Tensor] = None
+    total = 0
+    for i in tqdm(range(0, len(prompts), batch_size), desc="Mining next-token probs"):
+        batch = prompts[i : i + batch_size]
+        formatted = _apply_chat_template_or_raw(tokenizer, batch)
+        orig_pad = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        inputs = tokenizer(
+            formatted,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_seq_len,
+        ).to(device)
+        tokenizer.padding_side = orig_pad
+        with torch.no_grad():
+            outputs = model(**inputs, use_cache=False)
+            probs = outputs.logits[:, -1, :].float().softmax(dim=-1)  # [batch, vocab]
+        summed = probs.sum(dim=0).detach().to("cpu")
+        acc = summed if acc is None else acc + summed
+        total += probs.shape[0]
+        del outputs, probs
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+    if acc is None or total == 0:
+        raise ValueError("No prompts consumed by mining pass")
+    return acc / total
+
+
+def _mine_next_token_stats_multi(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompts: list[str],
+    batch_size: int,
+    max_seq_len: int,
+    device: str,
+    per_prompt_topk: int = 5,
+    num_positions: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Multi-position streaming stats via teacher-forced argmax walks.
+
+    For each prompt, does `num_positions` forward passes: at each step, records the
+    softmax over the last position, then teacher-forces the argmax token as the
+    next input. This walks down the greedy refusal continuation
+    ("I" -> "cannot" -> "help" -> "with"...) and lets multiple concepts surface
+    even when position 0 is dominated by a single token.
+
+    Aggregation:
+      - prob_sum[t] = sum over prompts of (max over positions of P(t | prefix))
+      - coverage[t] = count of prompts where t appears in per-prompt top-K
+                     at ANY of the visited positions
+    """
+    prob_sum: Optional[torch.Tensor] = None
+    coverage: Optional[torch.Tensor] = None
+    total = 0
+    for i in tqdm(range(0, len(prompts), batch_size), desc="Mining next-token stats"):
+        batch = prompts[i : i + batch_size]
+        formatted = _apply_chat_template_or_raw(tokenizer, batch)
+        orig_pad = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        inputs = tokenizer(
+            formatted,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_seq_len,
+        ).to(device)
+        tokenizer.padding_side = orig_pad
+        current_ids = inputs.input_ids
+        current_mask = inputs.attention_mask
+        b = current_ids.shape[0]
+        vocab_size = getattr(model.config, "vocab_size", None)
+
+        per_prompt_max: Optional[torch.Tensor] = None
+        per_prompt_seen: Optional[torch.Tensor] = None
+
+        for _ in range(num_positions):
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=current_ids, attention_mask=current_mask, use_cache=False,
+                )
+                probs = outputs.logits[:, -1, :].float().softmax(dim=-1)  # [b, V]
+            if per_prompt_max is None:
+                per_prompt_max = probs.clone()
+            else:
+                per_prompt_max = torch.maximum(per_prompt_max, probs)
+            _, top_idx = probs.topk(per_prompt_topk, dim=-1)
+            in_top_k = torch.zeros_like(probs)
+            in_top_k.scatter_(1, top_idx, 1.0)
+            if per_prompt_seen is None:
+                per_prompt_seen = in_top_k.clone()
+            else:
+                per_prompt_seen = torch.maximum(per_prompt_seen, in_top_k)
+            # Teacher-force top-1 for the next step
+            next_tokens = probs.argmax(dim=-1, keepdim=True)
+            current_ids = torch.cat([current_ids, next_tokens], dim=1)
+            current_mask = torch.cat([current_mask, torch.ones_like(next_tokens)], dim=1)
+            del outputs, probs, in_top_k
+
+        batch_prob = per_prompt_max.sum(dim=0).detach().to("cpu")
+        batch_cov = per_prompt_seen.sum(dim=0).detach().to("cpu")
+        prob_sum = batch_prob if prob_sum is None else prob_sum + batch_prob
+        coverage = batch_cov if coverage is None else coverage + batch_cov
+        total += b
+        del per_prompt_max, per_prompt_seen
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+    if prob_sum is None or total == 0:
+        raise ValueError("No prompts consumed by mining pass")
+    return prob_sum, coverage, total
+
+
+def _mine_next_token_stats(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompts: list[str],
+    batch_size: int,
+    max_seq_len: int,
+    device: str,
+    per_prompt_topk: int = 5,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Single-pass streaming stats for the last-position softmax across `prompts`.
+
+    Returns (prob_sum, coverage, n_prompts) where
+      - prob_sum[t] = sum over prompts of P(t | prompt)
+      - coverage[t] = count of prompts where t is in the per-prompt top-K
+    """
+    prob_sum: Optional[torch.Tensor] = None
+    coverage: Optional[torch.Tensor] = None
+    total = 0
+    for i in tqdm(range(0, len(prompts), batch_size), desc="Mining next-token stats"):
+        batch = prompts[i : i + batch_size]
+        formatted = _apply_chat_template_or_raw(tokenizer, batch)
+        orig_pad = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        inputs = tokenizer(
+            formatted,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_seq_len,
+        ).to(device)
+        tokenizer.padding_side = orig_pad
+        with torch.no_grad():
+            outputs = model(**inputs, use_cache=False)
+            probs = outputs.logits[:, -1, :].float().softmax(dim=-1)  # [batch, vocab]
+        # Coverage: mark per-prompt top-K positions
+        _, top_idx = probs.topk(per_prompt_topk, dim=-1)
+        in_top_k = torch.zeros_like(probs)
+        in_top_k.scatter_(1, top_idx, 1.0)
+
+        batch_prob = probs.sum(dim=0).detach().to("cpu")
+        batch_cov = in_top_k.sum(dim=0).detach().to("cpu")
+        prob_sum = batch_prob if prob_sum is None else prob_sum + batch_prob
+        coverage = batch_cov if coverage is None else coverage + batch_cov
+        total += probs.shape[0]
+        del outputs, probs, in_top_k
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+    if prob_sum is None or total == 0:
+        raise ValueError("No prompts consumed by mining pass")
+    return prob_sum, coverage, total
+
+
+def _filter_and_build(
+    tokenizer,
+    scores: torch.Tensor,
+    top_k: int,
+    min_score: float,
+    exclude_tokens: Optional[set[str]],
+    score_name: str,
+    extras: dict[int, dict],
+) -> list[MinedConcept]:
+    """Shared post-processing: over-fetch, decode, filter, build MinedConcept list."""
+    fetch_k = min(max(top_k * 6, top_k + 20), scores.shape[0])
+    top = torch.topk(scores, k=fetch_k)
+    exclude_tokens = set(exclude_tokens or set())
+    results: list[MinedConcept] = []
+    seen_norm: set[str] = set()
+    for score, tid in zip(top.values.tolist(), top.indices.tolist()):
+        if score < min_score:
+            break
+        try:
+            concept_str = tokenizer.decode([tid])
+        except Exception:
+            continue
+        norm = concept_str.strip()
+        if not norm or norm in exclude_tokens or norm in seen_norm:
+            continue
+        if len(norm) == 1 and not norm.isalnum():
+            continue
+        seen_norm.add(norm)
+        extra = extras.get(int(tid), {})
+        results.append(MinedConcept(
+            concept=concept_str,
+            token_id=int(tid),
+            specificity=float(score),
+            p_harmful=float(extra.get("p_harmful", 0.0)),
+            p_harmless=float(extra.get("p_harmless", 0.0)),
+        ))
+        if len(results) >= top_k:
+            break
+    return results
+
+
+def mine_refusal_concepts(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    harmful_prompts: list[str],
+    harmless_prompts: Optional[list[str]] = None,
+    top_k: int = 8,
+    min_specificity: float = 0.005,
+    batch_size: int = 4,
+    max_seq_len: int = 128,
+    device: str = "cuda",
+    exclude_tokens: Optional[set[str]] = None,
+    mode: str = "consensus",
+    per_prompt_topk: int = 5,
+    min_coverage: float = 0.2,
+    num_positions: int = 4,
+) -> list[MinedConcept]:
+    """Discover model-specific refusal-token concepts.
+
+    Two strategies:
+
+    - "consensus" (default): find tokens that MANY harmful prompts converge on,
+      independent of what harmless prompts do. Score = coverage * mean_prob,
+      where coverage is the fraction of harmful prompts where the token is in
+      the per-prompt top-K. Rationale: refusals are the mode of the harmful-
+      prompt response distribution; helpful responses to diverse harmless
+      prompts diverge, so subtracting them is uninformative.
+
+    - "contrast": specificity = mean P(t | harmful) - mean P(t | harmless).
+      Discriminates against dual-use tokens (" I", " can") that appear in
+      both response types. Requires harmless_prompts.
+
+    Args:
+        mode: "consensus" (default) or "contrast"
+        top_k: max concepts to return
+        min_specificity: skip tokens whose final score is below this
+        per_prompt_topk: (consensus) top-K per prompt for coverage counting
+        min_coverage: (consensus) minimum fraction of prompts where the token
+                      must be in per-prompt top-K (default 0.2 = 20%)
+        exclude_tokens: iterable of visible strings (after strip) to filter out
+    """
+    model.eval()
+    if mode == "consensus":
+        logger.info(
+            f"Concept mining (consensus, multi-position): {len(harmful_prompts)} harmful prompts, "
+            f"positions={num_positions}, per-position top-K={per_prompt_topk}, "
+            f"min_coverage={min_coverage}"
+        )
+        prob_sum, coverage, n = _mine_next_token_stats_multi(
+            model, tokenizer, harmful_prompts, batch_size, max_seq_len, device,
+            per_prompt_topk=per_prompt_topk, num_positions=num_positions,
+        )
+        mean_prob = prob_sum / n              # [vocab] — mean of per-prompt max prob across visited positions
+        cov_frac = coverage / n               # [vocab] — fraction of prompts where t is in top-K at some position
+        # Score: multiplicative — both presence AND consistent presence matter
+        score = cov_frac * mean_prob
+        # Zero out tokens below coverage threshold
+        score = torch.where(cov_frac >= min_coverage, score, torch.zeros_like(score))
+        # Build the "extras" map (p_harmful used as mean_prob; p_harmless left 0)
+        # Only compute for the top candidates to save time
+        fetch_k = min(max(top_k * 6, top_k + 20), score.shape[0])
+        top_ids = torch.topk(score, k=fetch_k).indices.tolist()
+        extras = {tid: {"p_harmful": float(mean_prob[tid].item()), "p_harmless": float(cov_frac[tid].item())}
+                  for tid in top_ids}
+        results = _filter_and_build(
+            tokenizer, score, top_k, min_specificity, exclude_tokens,
+            score_name="score", extras=extras,
+        )
+        # For consensus, `specificity` on MinedConcept is the score (cov * mean_prob);
+        # p_harmful holds mean_prob, p_harmless holds cov_frac. Display code labels these.
+
+    elif mode == "contrast":
+        if harmless_prompts is None:
+            raise ValueError("contrast mode requires harmless_prompts")
+        logger.info(
+            f"Concept mining (contrast): {len(harmful_prompts)} harmful, "
+            f"{len(harmless_prompts)} harmless prompts"
+        )
+        harm_sum, _, n_harm = _mine_next_token_stats(
+            model, tokenizer, harmful_prompts, batch_size, max_seq_len, device,
+        )
+        harmless_sum, _, n_harmless = _mine_next_token_stats(
+            model, tokenizer, harmless_prompts, batch_size, max_seq_len, device,
+        )
+        p_harm = harm_sum / n_harm
+        p_harmless = harmless_sum / n_harmless
+        specificity = p_harm - p_harmless
+        extras = {}
+        # For contrast, populate p_harmful / p_harmless for each candidate
+        fetch_k = min(max(top_k * 6, top_k + 20), specificity.shape[0])
+        top_ids = torch.topk(specificity, k=fetch_k).indices.tolist()
+        extras = {tid: {"p_harmful": float(p_harm[tid].item()),
+                        "p_harmless": float(p_harmless[tid].item())}
+                  for tid in top_ids}
+        results = _filter_and_build(
+            tokenizer, specificity, top_k, min_specificity, exclude_tokens,
+            score_name="specificity", extras=extras,
+        )
+    else:
+        raise ValueError(f"Unknown mining mode: {mode!r} (expected 'consensus' or 'contrast')")
+
+    if not results:
+        logger.warning(
+            "Concept mining produced no candidates above min_score=%.4f (mode=%s). "
+            "This can happen if the model no longer refuses (already abliterated) "
+            "or if its refusal openers are highly varied.",
+            min_specificity, mode,
+        )
+    else:
+        logger.info(
+            "Mined %d refusal concepts (mode=%s): %s",
+            len(results), mode,
+            ", ".join(f"{r.concept!r} ({r.specificity:.4f})" for r in results),
+        )
+    return results
 
 
 @dataclass
@@ -74,6 +438,10 @@ class JLensConfig:
     exclude_threshold: float = 0.2  # signal below this -> exclude layer
     min_multiplier: float = 0.1
     aggressive_threshold: float = 0.8
+    # Optional pre-resolved concept -> token_id mapping (from mining).
+    # When set, the extractor uses these ids directly, bypassing re-tokenization
+    # of the concept string (which can be unstable for BPE tokenizers).
+    concept_token_ids: Optional[dict[str, int]] = None
 
 
 @dataclass
@@ -167,9 +535,18 @@ class JLensExtractor:
         self._hooks = []
 
     def _concept_token_ids(self, concepts: list[str]) -> dict[str, int]:
-        """Map each concept string to its first-token id, dropping unknowns."""
+        """Map each concept string to its first-token id, dropping unknowns.
+
+        If self.config.concept_token_ids is set, prefer those direct id mappings
+        over re-tokenizing the string (avoids BPE round-trip drift for tokens
+        discovered via contrastive mining).
+        """
+        preset = self.config.concept_token_ids or {}
         out: dict[str, int] = {}
         for c in concepts:
+            if c in preset:
+                out[c] = int(preset[c])
+                continue
             ids = self.tokenizer.encode(c, add_special_tokens=False)
             if not ids:
                 logger.warning(f"J-lens: concept {c!r} encodes to empty; skipping")
@@ -180,12 +557,11 @@ class JLensExtractor:
     def _format_batch(self, prompts: list[str]) -> list[str]:
         # apply_chat_template exists on all tokenizers but raises if no template is set.
         # Base LMs (GPT-2 etc.) have no chat template — fall back to raw prompts.
+        # Reasoning-mode models get thinking disabled (see _apply_chat_template_no_think).
         if getattr(self.tokenizer, "chat_template", None):
             return [
-                self.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": p}],
-                    tokenize=False,
-                    add_generation_prompt=True,
+                _apply_chat_template_no_think(
+                    self.tokenizer, [{"role": "user", "content": p}]
                 )
                 for p in prompts
             ]
@@ -473,7 +849,7 @@ def generate_layer_target_map(
 def restrict_direction_to_jlens_subspace(
     direction: torch.Tensor,
     basis: torch.Tensor,
-    min_projection_ratio: float = 0.2,
+    min_projection_ratio: float = 0.1,
 ) -> tuple[torch.Tensor, float]:
     """Project `direction` onto the column-space of `basis` (assumed orthonormal).
 
@@ -507,3 +883,57 @@ def save_target_map_json(target_map: dict, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(target_map, f, indent=2, sort_keys=False)
     logger.info(f"Wrote layer target map to {path}")
+
+
+def build_jspace_config_dict(
+    mode: str,
+    model_path: str,
+    output_path: str,
+    device: str,
+    dtype: str,
+    jlens_params: dict,
+    concepts_params: dict,
+    target_map_params: Optional[dict] = None,
+    abliteration_params: Optional[dict] = None,
+    iterative_params: Optional[dict] = None,
+) -> dict:
+    """Assemble a J-space-specific abliteration_config.json payload.
+
+    Structure is mode-aware: each section is present only when it applies.
+
+    Args:
+        mode: "map", "restrict", or "iterative"
+        jlens_params: J-lens extraction settings (num_prompts, batch_size, basis_rank, ...)
+        concepts_params: source + mining settings + list of mined concepts (if any)
+        target_map_params: exclude_threshold, min_multiplier, layer counts (map mode)
+        abliteration_params: direction_multiplier, winsorization, etc. (restrict/iterative)
+        iterative_params: loop settings + convergence result (iterative)
+    """
+    payload = {
+        "abliteration_type": "j-space",
+        "j_space_mode": mode,
+        "model_path": model_path,
+        "output_path": str(output_path),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "device": device,
+        "dtype": dtype,
+        "j_lens": jlens_params,
+        "concepts": concepts_params,
+    }
+    if target_map_params is not None:
+        payload["target_map"] = target_map_params
+    if abliteration_params is not None:
+        payload["abliteration"] = abliteration_params
+    if iterative_params is not None:
+        payload["iterative"] = iterative_params
+    return payload
+
+
+def save_jspace_config_json(payload: dict, output_path: str) -> None:
+    """Write J-space abliteration config to <output_path>/abliteration_config.json."""
+    out = Path(output_path)
+    out.mkdir(parents=True, exist_ok=True)
+    dest = out / "abliteration_config.json"
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=False, default=str)
+    logger.info(f"Wrote J-space config to {dest}")

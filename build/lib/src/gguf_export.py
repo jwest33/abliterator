@@ -227,6 +227,67 @@ def detect_vision_model(model_path: Path) -> tuple[bool, Optional[str]]:
     return False, None
 
 
+def needs_no_mtp_flag(model_path: Path) -> bool:
+    """
+    Detect Qwen3.5/3.6-style models whose config declares MTP layers but whose
+    safetensors don't ship MTP weights. Without --no-mtp the converter writes
+    inflated block_count / nextn_predict_layers and llama.cpp fails to load
+    with "missing tensor 'blk.<N>.attn_norm.weight'".
+    """
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return False
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return False
+
+    mtp_layers = 0
+    for scope in (config, config.get("text_config", {}) or {}):
+        if isinstance(scope, dict):
+            v = scope.get("mtp_num_hidden_layers") or scope.get("num_nextn_predict_layers")
+            if isinstance(v, int) and v > mtp_layers:
+                mtp_layers = v
+    if mtp_layers <= 0:
+        return False
+
+    def _has_mtp_key(keys) -> bool:
+        for k in keys:
+            if k.startswith("mtp.") or k.startswith("model.mtp."):
+                return True
+        return False
+
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+            if _has_mtp_key((idx.get("weight_map") or {}).keys()):
+                return False
+            return True
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    single = model_path / "model.safetensors"
+    if single.exists():
+        try:
+            import struct
+            with open(single, "rb") as f:
+                header_size = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(header_size).decode("utf-8"))
+            keys = (k for k in header.keys() if k != "__metadata__")
+            if _has_mtp_key(keys):
+                return False
+            return True
+        except (json.JSONDecodeError, IOError, struct.error):
+            pass
+
+    # Config declares MTP but we couldn't confirm weights either way; err on the
+    # side of caution and pass --no-mtp so the runtime doesn't reject the file.
+    return True
+
+
 def has_vision_files(model_path: Path) -> bool:
     """
     Check if a model directory has the vision encoder files needed for mmproj export.
@@ -449,6 +510,14 @@ def convert_hf_to_gguf(
     # Add --mmproj flag for vision models to export multimodal projector
     if is_vision_model:
         cmd.append("--mmproj")
+
+    # Qwen3.5/3.6: config may declare MTP layers that the safetensors don't
+    # actually contain (e.g. base Qwen3.5-9B). --no-mtp keeps block_count in
+    # sync with the emitted tensors so llama.cpp doesn't look for blk.<N>.
+    if needs_no_mtp_flag(model_path):
+        cmd.append("--no-mtp")
+        if progress_callback:
+            progress_callback("Model declares MTP layers but has no MTP weights - passing --no-mtp")
 
     if progress_callback:
         progress_callback(f"Running: {' '.join(cmd)}")

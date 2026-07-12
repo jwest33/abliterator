@@ -889,6 +889,16 @@ class AbliterationConfig:
     jlens_max_seq_len: int = 64
     jlens_grad_checkpoint: bool = False
     jlens_concepts: Optional[list[str]] = None     # None = default refusal anchors
+    jlens_concept_token_ids: Optional[dict] = None  # Optional pre-resolved concept -> token_id map (from mining)
+    # Concept mining: when True, discover concepts empirically from the model's
+    # own next-token distribution on harmful prompts before running J-lens.
+    # mining_mode: "consensus" (mode-based on harmful only; recommended) or
+    #              "contrast" (mean P(harmful) - mean P(harmless))
+    mine_jlens_concepts: bool = False
+    mine_top_k: int = 8
+    mine_min_specificity: float = 0.005
+    mining_mode: str = "consensus"
+    mine_num_positions: int = 4
 
     # Hybrid architecture strategy (Qwen3.5, etc.)
     hybrid_strategy: str = "auto"  # "auto" (detect+apply), "uniform" (current behavior)
@@ -1080,6 +1090,25 @@ def detect_hybrid_architecture(model_path: str) -> HybridArchitectureInfo:
 
 
 # Activation Extraction
+
+
+def _apply_chat_template_no_think(tokenizer, messages: list[dict]) -> str:
+    """Apply chat template with add_generation_prompt=True and thinking disabled.
+
+    Reasoning-mode models (Qwen3.5, DeepSeek-R1, etc.) inject a `<think>` prefix
+    by default, which puts the response's next token inside a reasoning block
+    instead of at the actual refusal/acceptance. Passing enable_thinking=False
+    forces the response to start at position 0. Falls back for tokenizers
+    that don't accept the kwarg.
+    """
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
 
 
 def get_transformer_layers(model):
@@ -1276,13 +1305,12 @@ class ActivationExtractor:
             # Tokenize with chat template if the tokenizer actually has one set
             # (apply_chat_template exists on every tokenizer but raises when chat_template is None)
             if getattr(self.tokenizer, "chat_template", None):
-                formatted_prompts = []
-                for prompt in batch_prompts:
-                    messages = [{"role": "user", "content": prompt}]
-                    formatted = self.tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
+                formatted_prompts = [
+                    _apply_chat_template_no_think(
+                        self.tokenizer, [{"role": "user", "content": prompt}]
                     )
-                    formatted_prompts.append(formatted)
+                    for prompt in batch_prompts
+                ]
             else:
                 formatted_prompts = batch_prompts
 
@@ -1968,12 +1996,49 @@ def compute_refusal_directions(
                 logger.info(f"Loading cached J-lens vectors from {config.jlens_vectors_path}")
                 jlens_obj = JLensVectors.load(config.jlens_vectors_path)
             else:
+                # Explicit fallback to defaults if no concepts supplied — avoids passing None
+                # to the dataclass, which would override the default_factory.
+                from src.jlens import DEFAULT_REFUSAL_CONCEPTS as _DEFAULT_JL_CONCEPTS
+                _concepts = list(config.jlens_concepts) if config.jlens_concepts else list(_DEFAULT_JL_CONCEPTS)
+                _token_ids = config.jlens_concept_token_ids
+
+                # Optional up-front concept mining. Skipped if the caller already
+                # supplied a token_id map (already mined externally) or explicit concepts
+                # without the flag.
+                if config.mine_jlens_concepts and _token_ids is None:
+                    from src.jlens import mine_refusal_concepts as _mine
+                    logger.info(
+                        f"Mining refusal concepts from model responses (mode={config.mining_mode})..."
+                    )
+                    try:
+                        mined = _mine(
+                            model, tokenizer,
+                            harmful_prompts=config.harmful_prompts,
+                            harmless_prompts=(
+                                config.harmless_prompts
+                                if config.mining_mode == "contrast" else None
+                            ),
+                            top_k=config.mine_top_k,
+                            min_specificity=config.mine_min_specificity,
+                            batch_size=max(config.jlens_batch_size, 4),
+                            max_seq_len=max(config.jlens_max_seq_len, 128),
+                            device=config.device,
+                            mode=config.mining_mode,
+                            num_positions=config.mine_num_positions,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Concept mining failed ({e}); using default concepts")
+                        mined = []
+                    if mined:
+                        _concepts = [m.concept for m in mined]
+                        _token_ids = {m.concept: m.token_id for m in mined}
+
                 logger.info(
                     f"Computing J-lens vectors inline ({config.jlens_num_prompts} prompts, "
-                    f"basis rank<={config.jlens_basis_rank})..."
+                    f"basis rank<={config.jlens_basis_rank}, {len(_concepts)} concepts)..."
                 )
                 jl_cfg = JLensConfig(
-                    concepts=(config.jlens_concepts if config.jlens_concepts else None) or None,
+                    concepts=_concepts,
                     num_prompts=config.jlens_num_prompts,
                     batch_size=config.jlens_batch_size,
                     max_seq_len=config.jlens_max_seq_len,
@@ -1981,6 +2046,7 @@ def compute_refusal_directions(
                     device=config.device,
                     dtype=config.dtype,
                     basis_rank=config.jlens_basis_rank,
+                    concept_token_ids=_token_ids,
                 )
                 jlens_obj = compute_jlens_vectors(
                     model, tokenizer, config.harmful_prompts, jl_cfg
@@ -3219,13 +3285,12 @@ def test_prompts_for_refusal_batch(
 
         # Format with chat template if available
         if hasattr(tokenizer, "apply_chat_template"):
-            formatted_prompts = []
-            for prompt in batch_prompts:
-                messages = [{"role": "user", "content": prompt}]
-                formatted = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+            formatted_prompts = [
+                _apply_chat_template_no_think(
+                    tokenizer, [{"role": "user", "content": prompt}]
                 )
-                formatted_prompts.append(formatted)
+                for prompt in batch_prompts
+            ]
         else:
             formatted_prompts = batch_prompts
 
