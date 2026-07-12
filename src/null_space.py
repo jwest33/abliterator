@@ -457,14 +457,22 @@ class NullSpaceActivationExtractor:
         for i in tqdm(range(0, len(prompts), batch_size), desc="Extracting preservation activations"):
             batch = prompts[i : i + batch_size]
 
-            # Format with chat template if available
+            # Format with chat template if available. Disable thinking so
+            # preservation activations reflect actual response tokens, not
+            # reasoning-block prefixes (Qwen3.5, DeepSeek-R1, ...).
             if hasattr(self.tokenizer, "apply_chat_template"):
                 formatted = []
                 for p in batch:
                     messages = [{"role": "user", "content": p}]
-                    fmt = self.tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
+                    try:
+                        fmt = self.tokenizer.apply_chat_template(
+                            messages, tokenize=False, add_generation_prompt=True,
+                            enable_thinking=False,
+                        )
+                    except TypeError:
+                        fmt = self.tokenizer.apply_chat_template(
+                            messages, tokenize=False, add_generation_prompt=True,
+                        )
                     formatted.append(fmt)
             else:
                 formatted = batch

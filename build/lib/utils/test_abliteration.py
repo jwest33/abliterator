@@ -1328,6 +1328,31 @@ Examples:
         help="Device to use (default: cuda if available)",
     )
 
+    # Audit subcommand: diagnose the log-likelihood detector against actual generations
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help="Audit the log-likelihood refusal detector against actual generations. "
+             "Reports false positives / negatives, per-anchor breakdown, and a "
+             "suggested threshold from ROC sweep."
+    )
+    audit_parser.add_argument("--model_path", "-m", type=str, required=True)
+    audit_parser.add_argument("--harmful_prompts", type=str, default=None,
+                              help="Path to harmful prompts file (default: prompts/harmful.txt)")
+    audit_parser.add_argument("--harmless_prompts", type=str, default=None,
+                              help="Path to harmless prompts file (default: prompts/harmless.txt)")
+    audit_parser.add_argument("--limit", type=int, default=25,
+                              help="Prompts per source to audit (default: 25 harmful + 25 harmless)")
+    audit_parser.add_argument("--max_new_tokens", type=int, default=40,
+                              help="Tokens generated per prompt for ground-truth labeling (default: 40)")
+    audit_parser.add_argument("--batch_size", "-b", type=int, default=4)
+    audit_parser.add_argument("--threshold", type=float, default=-7.0,
+                              help="Detector threshold to audit (default: -7.0)")
+    audit_parser.add_argument("--anchors", type=str, default=None,
+                              help="Comma-separated refusal anchor strings (default: I cannot,I can't,I'm sorry,I apologize)")
+    audit_parser.add_argument("--dtype", type=str, choices=["float16", "bfloat16", "float32"], default="float16")
+    audit_parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    audit_parser.add_argument("--output_dir", "-o", type=str, default="./eval_results")
+
     args = parser.parse_args()
 
     if args.command == "eval":
@@ -1435,6 +1460,29 @@ Examples:
         logger.info(f"Median KL:          {result.median_kl_divergence:.4f} nats")
         logger.info(f"Max KL:             {result.max_kl_divergence:.4f} nats")
         logger.info(f"Eval time:          {result.eval_time_seconds:.1f}s")
+
+    elif args.command == "audit":
+        from utils.refusal_detector_audit import print_audit_report, run_audit
+
+        harmful_path = args.harmful_prompts or get_default_prompts_path("harmful.txt")
+        harmless_path = args.harmless_prompts or get_default_prompts_path("harmless.txt")
+        anchors = None
+        if args.anchors:
+            anchors = tuple(a.strip() for a in args.anchors.split(",") if a.strip())
+        audits, summary = run_audit(
+            model_path=args.model_path,
+            harmful_prompts_path=harmful_path,
+            harmless_prompts_path=harmless_path,
+            limit_per_source=args.limit,
+            max_new_tokens=args.max_new_tokens,
+            batch_size=args.batch_size,
+            threshold=args.threshold,
+            refusal_anchors=anchors,
+            device=args.device,
+            dtype=args.dtype,
+            output_dir=args.output_dir,
+        )
+        print_audit_report(audits, summary)
 
     else:
         parser.print_help()

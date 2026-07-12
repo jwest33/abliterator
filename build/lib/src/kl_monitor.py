@@ -174,12 +174,25 @@ class KLDivergenceMonitor:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def _format_prompt(self, prompt: str) -> str:
-        """Format prompt with chat template if one is set on the tokenizer."""
+        """Format prompt with chat template if one is set on the tokenizer.
+
+        For reasoning-mode models (Qwen3.5, DeepSeek-R1, ...) the default
+        template injects a `<think>` prefix, which makes KL measure the
+        distribution over reasoning tokens instead of response tokens.
+        Pass enable_thinking=False so the KL guardrail sees the actual
+        user-facing response distribution.
+        """
         if getattr(self.tokenizer, "chat_template", None):
             messages = [{"role": "user", "content": prompt}]
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
         return prompt
 
     def _forward_batch(self, prompts: list[str]) -> list[torch.Tensor]:

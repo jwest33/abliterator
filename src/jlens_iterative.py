@@ -53,17 +53,41 @@ class JLensIterativeConfig:
     """Configuration for the J-lens-guided iterative abliteration loop."""
 
     # Convergence
+    #
+    # Design: iteration 1 with step_multiplier=1.0 is functionally equivalent to
+    # a single restrict-mode pass (same direction_multiplier, same J-lens basis
+    # on the ORIGINAL model). Iterations 2+ recompute J-lens on the MODIFIED
+    # model — this is what catches the Hydra effect (refusal machinery migrating
+    # between layers). So the loop is "restrict pass, re-check J-space on the
+    # new model state, restrict again if refusal remains." Halves on KL breach.
     max_iterations: int = 10
     target_refusal_rate: float = 0.05
     min_improvement: float = 0.01           # stop if refusal rate improves less than this for 2 rounds
-    step_multiplier: float = 0.4            # per-iteration ablation strength
+    step_multiplier: float = 1.0            # per-iteration ablation strength (matches restrict's direction_multiplier)
     min_step_multiplier: float = 0.05       # floor when halving after KL breach
+    max_step_multiplier: float = 1.0        # cap on step growth when escalating
+    step_escalation: bool = True            # if plateauing far from target, grow step (up to max)
+    escalation_factor: float = 1.5          # multiplier applied when escalating step
+    escalation_gap_ratio: float = 3.0       # only escalate while refusal_rate > target * ratio
 
     # Eval
     eval_prompt_count: int = 50             # refusal-rate probe size per iteration
-    refusal_threshold: float = -7.0
+    refusal_threshold: float = -7.0         # max anchor log-prob above this ⇒ predict refusal
+    auto_calibrate_threshold: bool = False  # if True, run a mini-audit vs actual generations before the loop and pick a threshold that maximizes accuracy
+    calibrate_num_harmless: int = 20        # audit sample size per class when auto-calibrating
+    calibrate_num_harmful: int = 20
+    calibrate_max_new_tokens: int = 40
 
-    # KL guardrail (optional)
+    # Base abliteration prompt handling (aligned with run_abliteration / restrict mode)
+    abliteration_num_prompts: int = 32      # harmful+harmless count used for direction extraction
+    filter_prompts: bool = True             # run filter_harmful_prompts_by_refusal once before the loop
+
+    # KL tracking + guardrail. Tracking is a diagnostic: it caches reference
+    # logits and computes KL(base||current) every iteration so you can see
+    # quality drift in the logs. The guardrail is a rollback policy layered
+    # on top — it fires only if track_kl is also on and mean_kl exceeds
+    # kl_threshold. Turning off track_kl also disables the guardrail.
+    track_kl: bool = True
     use_kl_guardrail: bool = False
     kl_threshold: float = 0.5
     kl_reference_prompts_path: Optional[str] = None
@@ -99,7 +123,6 @@ class JLensIterativeConfig:
     use_winsorization: bool = False
     winsorize_percentile: float = 0.995
     norm_preservation: bool = True
-    filter_prompts: bool = True
 
     # System
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -143,6 +166,78 @@ class IterationResult:
             "final_kl": self.final_kl,
             "history": [asdict(s) for s in self.history],
         }
+
+
+def _inline_audit(
+    model,
+    tokenizer,
+    detector_cfg: RefusalDetectorConfig,
+    harmful_pool: list[str],
+    harmless_prompts: list[str],
+    num_harmful: int,
+    num_harmless: int,
+    max_new_tokens: int,
+):
+    """Run a refusal-detector audit against the already-loaded model.
+
+    Avoids the double model load that would happen if we called `run_audit`
+    directly. Reuses the audit's inner logic (per-anchor log-prob + greedy
+    generation + heuristic classifier + threshold sweep).
+    """
+    from utils.refusal_detector_audit import (
+        AuditSummary, PromptAudit, _generate_batch, _sweep_threshold,
+    )
+    from utils.test_abliteration import detect_refusal as heuristic_detect_refusal
+
+    detector = LogLikelihoodRefusalDetector(model, tokenizer, detector_cfg)
+    harmful = harmful_pool[:num_harmful]
+    harmless = harmless_prompts[:num_harmless]
+    all_prompts = [(p, "harmful") for p in harmful] + [(p, "harmless") for p in harmless]
+    prompts_only = [p for p, _ in all_prompts]
+
+    formatted = [detector.format_prompt(p) for p in prompts_only]
+    anchor_scores: dict[str, list[float]] = {}
+    for anchor in detector_cfg.refusal_anchors:
+        chunk_scores: list[float] = []
+        for i in range(0, len(formatted), 4):
+            chunk = formatted[i : i + 4]
+            lp = detector.get_log_prob(chunk, anchor)
+            chunk_scores.extend(lp.tolist())
+        anchor_scores[anchor] = chunk_scores
+
+    generations = _generate_batch(model, tokenizer, prompts_only, max_new_tokens, batch_size=4)
+
+    audits: list[PromptAudit] = []
+    for idx, ((prompt, source), gen) in enumerate(zip(all_prompts, generations)):
+        per_anchor = {a: anchor_scores[a][idx] for a in detector_cfg.refusal_anchors}
+        winning_anchor = max(per_anchor, key=per_anchor.get)
+        max_score = per_anchor[winning_anchor]
+        predicted = max_score > detector_cfg.threshold
+        gen_is_refusal = heuristic_detect_refusal(gen)
+        audits.append(PromptAudit(
+            idx=idx, source=source, prompt=prompt,
+            anchor_log_probs=per_anchor, max_score=max_score,
+            winning_anchor=winning_anchor, predicted_refusal=predicted,
+            generated_text=gen, generation_is_refusal=gen_is_refusal,
+            agreement=predicted == gen_is_refusal,
+        ))
+
+    summary = AuditSummary(
+        threshold=detector_cfg.threshold,
+        num_prompts=len(audits),
+        num_harmful=len(harmful),
+        num_harmless=len(harmless),
+    )
+    for a in audits:
+        gt = a.generation_is_refusal
+        if a.predicted_refusal and gt: summary.true_positive += 1
+        elif a.predicted_refusal and not gt: summary.false_positive += 1
+        elif not a.predicted_refusal and not gt: summary.true_negative += 1
+        else: summary.false_negative += 1
+    thr, acc = _sweep_threshold(audits)
+    summary.suggested_threshold = thr
+    summary.suggested_threshold_accuracy = acc
+    return audits, summary
 
 
 def _measure_refusal_rate(
@@ -217,20 +312,16 @@ def run_jlens_iterative_abliteration(
         f"max_iterations={config.max_iterations}, step={config.step_multiplier}"
     )
 
-    # Load prompts
-    harmful_prompts = load_prompts_from_file(
-        harmful_prompts_path, num_prompts=max(config.jlens_num_prompts, 50)
+    # Load prompts. If filter_prompts=True, load the full pool (None) so we can
+    # sample refused prompts from it — matches run_abliteration behavior.
+    abl_n = max(config.abliteration_num_prompts, 1)
+    harmful_pool = load_prompts_from_file(
+        harmful_prompts_path,
+        num_prompts=None if config.filter_prompts else abl_n,
     )
-    harmless_prompts = load_prompts_from_file(
-        harmless_prompts_path, num_prompts=max(config.jlens_num_prompts, 50)
-    )
-    if not harmful_prompts or not harmless_prompts:
+    harmless_prompts = load_prompts_from_file(harmless_prompts_path, num_prompts=abl_n)
+    if not harmful_pool or not harmless_prompts:
         raise ValueError("harmful/harmless prompts must be non-empty")
-
-    if eval_prompts is None:
-        eval_prompts = harmful_prompts[: config.eval_prompt_count]
-    else:
-        eval_prompts = eval_prompts[: config.eval_prompt_count]
 
     # Load model + tokenizer
     model, tokenizer = load_model_and_tokenizer(
@@ -242,11 +333,89 @@ def run_jlens_iterative_abliteration(
     detector_cfg = RefusalDetectorConfig(threshold=config.refusal_threshold)
     detector = LogLikelihoodRefusalDetector(model, tokenizer, detector_cfg)
 
-    # Optional KL guardrail
+    # Optional: run a mini-audit vs actual generations to pick a threshold
+    # calibrated for this specific model. The default -7.0 is wildly wrong for
+    # some model families (Qwen3.5-9B's harmless log-prob p95 is ~-1.32).
+    if config.auto_calibrate_threshold:
+        from utils.refusal_detector_audit import run_audit
+        logger.info(
+            f"Auto-calibrating refusal threshold (audit sample: "
+            f"{config.calibrate_num_harmful} harmful + "
+            f"{config.calibrate_num_harmless} harmless prompts)..."
+        )
+        # Free the detector first; the audit function loads its own model
+        # instance is unavoidable here because the audit is a self-contained
+        # tool. To avoid loading twice we call the internal pieces directly.
+        _, summary = _inline_audit(
+            model, tokenizer, detector_cfg,
+            harmful_pool=harmful_pool,
+            harmless_prompts=harmless_prompts,
+            num_harmful=min(config.calibrate_num_harmful, len(harmful_pool)),
+            num_harmless=min(config.calibrate_num_harmless, len(harmless_prompts)),
+            max_new_tokens=config.calibrate_max_new_tokens,
+        )
+        if summary.suggested_threshold is not None:
+            old_threshold = config.refusal_threshold
+            new_threshold = summary.suggested_threshold
+            logger.info(
+                f"  Calibrated threshold: {old_threshold} -> {new_threshold:.2f} "
+                f"(audit accuracy: {summary.suggested_threshold_accuracy:.3f}, "
+                f"harmless-FPR at old threshold: "
+                f"{summary.false_positive / max(1, summary.false_positive + summary.true_negative):.3f})"
+            )
+            config.refusal_threshold = new_threshold
+            detector_cfg.threshold = new_threshold
+            # Rebuild detector to pick up the new threshold
+            detector = LogLikelihoodRefusalDetector(model, tokenizer, detector_cfg)
+        else:
+            logger.warning("Auto-calibration returned no suggestion; keeping default threshold")
+
+    # Filter harmful prompts by actual refusal — matches run_abliteration. Do it
+    # ONCE, on the original model, so the direction is computed from prompts the
+    # model genuinely refuses (weakest signal otherwise).
+    if config.filter_prompts:
+        from src.abliterate import filter_harmful_prompts_by_refusal
+        # Build a minimal AbliterationConfig just for refusal_threshold / batch_size
+        filter_cfg = AbliterationConfig(
+            model_path=model_path,
+            output_path=output_path,
+            harmful_prompts=harmful_pool,
+            harmless_prompts=harmless_prompts,
+            num_prompts=abl_n,
+            refusal_threshold=config.refusal_threshold,
+            device=config.device,
+            dtype=config.dtype,
+        )
+        refused, _ = filter_harmful_prompts_by_refusal(
+            harmful_pool, model, tokenizer, filter_cfg, target_count=abl_n
+        )
+        if not refused:
+            raise ValueError(
+                "No harmful prompts were refused by the model — refusal direction "
+                "cannot be computed. Try disabling filter_prompts or lowering "
+                "refusal_threshold."
+            )
+        harmful_prompts = refused
+        logger.info(
+            f"Filtered to {len(harmful_prompts)} refused harmful prompts "
+            f"(pool size: {len(harmful_pool)})"
+        )
+    else:
+        harmful_prompts = harmful_pool[:abl_n]
+
+    if eval_prompts is None:
+        # Use the full pool for eval so we probe on ALL harmful prompts, not just
+        # the filtered/refused subset (matches restrict-mode eval semantics).
+        eval_prompts = harmful_pool[: config.eval_prompt_count]
+    else:
+        eval_prompts = eval_prompts[: config.eval_prompt_count]
+
+    # KL tracking + optional guardrail. Guardrail implies tracking.
     kl_monitor = None
     kl_ref_prompts: list[str] = []
     original_snapshot: Optional[WeightSnapshot] = None
-    if config.use_kl_guardrail:
+    track_kl_effective = config.track_kl or config.use_kl_guardrail
+    if track_kl_effective:
         # Load reference prompts for KL
         if kl_reference_prompts is None:
             path = config.kl_reference_prompts_path
@@ -265,11 +434,16 @@ def run_jlens_iterative_abliteration(
             kl_threshold=config.kl_threshold,
         )
         kl_monitor = KLDivergenceMonitor(model, tokenizer, kl_config, device=config.device)
-        logger.info(f"Caching reference logits for KL guardrail ({len(kl_ref_prompts)} prompts)...")
+        role = "guardrail" if config.use_kl_guardrail else "diagnostic"
+        logger.info(
+            f"Caching reference logits for KL {role} ({len(kl_ref_prompts)} prompts)..."
+        )
         kl_monitor.cache_reference_logits(kl_ref_prompts)
-        # Snapshot the ORIGINAL weights so we can always roll back to baseline
-        linear_names = get_linear_layer_names(model)
-        original_snapshot = WeightSnapshot(model, linear_names)
+        # Snapshot the ORIGINAL weights only when the guardrail may need to
+        # roll back to baseline. Diagnostic-only tracking never rolls back.
+        if config.use_kl_guardrail:
+            linear_names = get_linear_layer_names(model)
+            original_snapshot = WeightSnapshot(model, linear_names)
 
     # Baseline refusal rate
     baseline_refusal = _measure_refusal_rate(detector, eval_prompts)
@@ -307,39 +481,80 @@ def run_jlens_iterative_abliteration(
         linear_names = get_linear_layer_names(model)
         step_snapshot = WeightSnapshot(model, linear_names)
 
-        # Optional contrastive concept mining on the CURRENT model state
+        # Optional contrastive concept mining on the CURRENT model state.
+        # After iteration 1 the model has been partly abliterated, so mining
+        # from the ORIGINAL harmful set picks up compliance tokens (" a", "Here",
+        # " The", ...) instead of refusal patterns. Filter to prompts the model
+        # STILL refuses on the current state before mining.
         step_concepts: Optional[list[str]] = None
         step_concept_ids: Optional[dict[str, int]] = None
         if config.mine_concepts_each_iteration:
-            try:
-                mined = mine_refusal_concepts(
-                    model, tokenizer,
-                    harmful_prompts=harmful_prompts[: config.mine_num_prompts],
-                    harmless_prompts=(
-                        harmless_prompts[: config.mine_num_prompts]
-                        if config.mining_mode == "contrast" else None
-                    ),
-                    top_k=config.mine_top_k,
-                    min_specificity=config.mine_min_specificity,
-                    batch_size=config.mine_batch_size,
-                    max_seq_len=config.mine_max_seq_len,
-                    device=config.device,
-                    mode=config.mining_mode,
-                    num_positions=config.mine_num_positions,
+            mining_pool: list[str] = []
+            skipped_reason: Optional[str] = None
+            if it == 1:
+                mining_pool = harmful_prompts[: config.mine_num_prompts]
+            else:
+                # Re-check refusal on the current model. Use the ORIGINAL pool
+                # (pre-abliteration filter) so we don't restrict to a
+                # potentially-empty subset if refusal has collapsed.
+                candidate_pool = harmful_pool[: config.mine_num_prompts]
+                refused_flags = detector.detect_refusal_batch(candidate_pool)
+                mining_pool = [p for p, r in zip(candidate_pool, refused_flags) if r]
+                min_for_mining = max(8, config.mine_num_prompts // 4)
+                logger.info(
+                    f"  Concept-mining pool: {len(mining_pool)}/{len(candidate_pool)} "
+                    f"prompts still refused on current model"
                 )
-            except Exception as e:
-                logger.warning(f"Concept mining failed: {e}; using previous / default")
-                mined = []
-            if mined:
-                step_concepts = [m.concept for m in mined]
-                step_concept_ids = {m.concept: m.token_id for m in mined}
-                last_mined_concepts = step_concepts
-                last_mined_ids = step_concept_ids
-            elif last_mined_concepts:
-                logger.info("Mining collapsed; reusing last successful mined concepts")
-                step_concepts = last_mined_concepts
-                step_concept_ids = last_mined_ids
-            # else: falls through to config.jlens_concepts (defaults)
+                if len(mining_pool) < min_for_mining:
+                    skipped_reason = (
+                        f"only {len(mining_pool)} still-refused prompts "
+                        f"(need >= {min_for_mining}); mining a smaller set would "
+                        f"pick up compliance tokens instead of refusal patterns"
+                    )
+
+            if skipped_reason is not None:
+                if last_mined_concepts:
+                    logger.info(
+                        f"  Skipping concept re-mining ({skipped_reason}); "
+                        f"reusing previous concepts: {last_mined_concepts}"
+                    )
+                    step_concepts = last_mined_concepts
+                    step_concept_ids = last_mined_ids
+                else:
+                    logger.info(
+                        f"  Skipping concept re-mining ({skipped_reason}); "
+                        f"falling back to default concepts"
+                    )
+            else:
+                try:
+                    mined = mine_refusal_concepts(
+                        model, tokenizer,
+                        harmful_prompts=mining_pool,
+                        harmless_prompts=(
+                            harmless_prompts[: config.mine_num_prompts]
+                            if config.mining_mode == "contrast" else None
+                        ),
+                        top_k=config.mine_top_k,
+                        min_specificity=config.mine_min_specificity,
+                        batch_size=config.mine_batch_size,
+                        max_seq_len=config.mine_max_seq_len,
+                        device=config.device,
+                        mode=config.mining_mode,
+                        num_positions=config.mine_num_positions,
+                    )
+                except Exception as e:
+                    logger.warning(f"Concept mining failed: {e}; using previous / default")
+                    mined = []
+                if mined:
+                    step_concepts = [m.concept for m in mined]
+                    step_concept_ids = {m.concept: m.token_id for m in mined}
+                    last_mined_concepts = step_concepts
+                    last_mined_ids = step_concept_ids
+                elif last_mined_concepts:
+                    logger.info("Mining collapsed; reusing last successful mined concepts")
+                    step_concepts = last_mined_concepts
+                    step_concept_ids = last_mined_ids
+                # else: falls through to config.jlens_concepts (defaults)
 
         # Build config for this step (fresh J-lens computation via inline path)
         abl_cfg = _build_abliteration_config(
@@ -361,6 +576,21 @@ def run_jlens_iterative_abliteration(
         num_fell_back = sum(
             1 for r in ratios.values() if r < config.jlens_min_projection_ratio
         )
+        if num_targeted > 0 and num_fell_back >= num_targeted:
+            logger.warning(
+                f"  J-space restriction retained < {config.jlens_min_projection_ratio} "
+                f"on ALL {num_targeted} targeted layers — using unrestricted refusal "
+                f"direction everywhere this step. Consider lowering "
+                f"--jlens-min-projection-ratio, raising --jlens-basis-rank, or "
+                f"widening the concept list (defaults may not match this model's "
+                f"refusal geometry)."
+            )
+        elif num_fell_back > num_targeted // 2:
+            logger.info(
+                f"  J-space fallback: {num_fell_back}/{num_targeted} layers used "
+                f"unrestricted direction (retained ratio < "
+                f"{config.jlens_min_projection_ratio})"
+            )
 
         # Apply abliteration
         abliterate_model(model, directions, abl_cfg, None)
@@ -408,6 +638,18 @@ def run_jlens_iterative_abliteration(
                 break
             elif improvement < config.min_improvement:
                 plateau_rounds += 1
+                # If we're plateauing but still far from the target, the step is
+                # too small to move the needle. Escalate before halting.
+                far_from_target = cur_refusal > config.target_refusal_rate * config.escalation_gap_ratio
+                if config.step_escalation and far_from_target and step < config.max_step_multiplier:
+                    new_step = min(step * config.escalation_factor, config.max_step_multiplier)
+                    logger.info(
+                        f"  Plateau ({plateau_rounds} round(s)) far from target "
+                        f"({cur_refusal:.3f} > {config.target_refusal_rate * config.escalation_gap_ratio:.3f}); "
+                        f"escalating step {step:.3f} -> {new_step:.3f}"
+                    )
+                    step = new_step
+                    plateau_rounds = 0
             else:
                 plateau_rounds = 0
 
@@ -441,9 +683,17 @@ def run_jlens_iterative_abliteration(
             reason = "target_reached"
             break
         if plateau_rounds >= 2:
-            logger.info(f"No improvement for {plateau_rounds} rounds; halting")
-            reason = "plateau"
-            break
+            # Only halt-on-plateau when step is already at max — otherwise
+            # escalation above should have grown it. If we plateau at max step
+            # and still can't move refusal, further iterations won't help.
+            at_max_step = step >= config.max_step_multiplier - 1e-9
+            if at_max_step or not config.step_escalation:
+                logger.info(
+                    f"No improvement for {plateau_rounds} rounds at step={step:.3f} "
+                    f"(refusal_rate={cur_refusal:.3f}, target={config.target_refusal_rate}); halting"
+                )
+                reason = "plateau"
+                break
 
     # Free KL monitor caches (no dedicated .free method, just drop references)
     if kl_monitor is not None:

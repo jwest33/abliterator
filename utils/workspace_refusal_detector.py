@@ -136,11 +136,16 @@ class WorkspaceRefusalDetector:
 
     def format_prompt(self, prompt: str) -> str:
         if getattr(self.tokenizer, "chat_template", None):
-            return self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            messages = [{"role": "user", "content": prompt}]
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
         return prompt
 
     def _score_batch(self, prompts: list[str]) -> torch.Tensor:

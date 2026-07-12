@@ -909,6 +909,134 @@ def _display_mined_concepts(mined: list, mode: str = "consensus") -> None:
     console.print(table)
 
 
+def preview_and_edit_mined_concepts(
+    model_path: str,
+    device: str,
+    dtype: str,
+    mining_mode: str,
+    mine_top_k: int,
+    mine_min_specificity: float,
+    mine_num_positions: int,
+    mine_num_prompts: int,
+    batch_size: int,
+    max_seq_len: int,
+) -> tuple[Optional[list[str]], Optional[dict[str, int]], bool]:
+    """Mine refusal concepts, display them, and let the user deselect any before use.
+
+    Loads the model temporarily just to mine, then unloads it. This means the
+    subsequent abliteration pass reloads the model — the tradeoff is that the
+    user gets to review and edit the consensus list before committing.
+
+    Returns (concepts, concept_token_ids, ok). ok=False means the user aborted
+    the whole workflow. If ok=True and concepts is None, mining yielded nothing
+    or the user cleared the list; the caller should fall back to defaults.
+    """
+    from src.abliterate import load_prompts_from_file
+    from src.jlens import mine_refusal_concepts
+    from src.model_utils import load_model_and_tokenizer
+
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+    torch_dtype = dtype_map.get(dtype, torch.float16)
+
+    console.print(
+        f"\n[{THEME['primary']}]Loading model to mine consensus refusal concepts "
+        f"(preview step — model will reload for abliteration)...[/{THEME['primary']}]"
+    )
+    try:
+        model, tokenizer = load_model_and_tokenizer(
+            model_path, device=device, dtype=torch_dtype, trust_remote_code=True
+        )
+        tokenizer.padding_side = "left"
+    except Exception as e:
+        console.print(f"[red]Model load for mining failed: {e}[/red]")
+        return None, None, False
+
+    mined: list = []
+    try:
+        harmful_for_mining = load_prompts_from_file(
+            get_default_prompts_path("harmful.txt"), num_prompts=mine_num_prompts
+        )
+        harmless_for_mining = None
+        if mining_mode == "contrast":
+            harmless_for_mining = load_prompts_from_file(
+                get_default_prompts_path("harmless.txt"), num_prompts=mine_num_prompts
+            )
+        console.print(
+            f"[{THEME['primary']}]Mining refusal concepts (mode={mining_mode}, "
+            f"top_k={mine_top_k}, min_score={mine_min_specificity})...[/{THEME['primary']}]"
+        )
+        mined = mine_refusal_concepts(
+            model, tokenizer,
+            harmful_prompts=harmful_for_mining,
+            harmless_prompts=harmless_for_mining,
+            top_k=mine_top_k,
+            min_specificity=mine_min_specificity,
+            batch_size=max(batch_size, 4),
+            max_seq_len=max(max_seq_len, 128),
+            device=device,
+            mode=mining_mode,
+            num_positions=mine_num_positions,
+        )
+    except Exception as e:
+        console.print(f"[{THEME['warning']}]Mining failed: {e}[/{THEME['warning']}]")
+        mined = []
+    finally:
+        del model, tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if not mined:
+        console.print(
+            f"[{THEME['warning']}]Mining yielded no concepts; abliteration will "
+            f"fall back to defaults.[/{THEME['warning']}]"
+        )
+        return None, None, True
+
+    _display_mined_concepts(mined, mode=mining_mode)
+
+    choices = [
+        questionary.Choice(
+            title=f"{repr(m.concept)}  (score={m.specificity:.4f}, token_id={m.token_id})",
+            value=m.concept,
+            checked=True,
+        )
+        for m in mined
+    ]
+    kept = questionary.checkbox(
+        "Select the concepts to KEEP (space to toggle, enter to confirm):",
+        choices=choices,
+        style=custom_style,
+    ).ask()
+
+    if kept is None:
+        console.print(f"[{THEME['warning']}]Concept selection cancelled; aborting workflow.[/{THEME['warning']}]")
+        return None, None, False
+
+    if not kept:
+        console.print(
+            f"[{THEME['warning']}]No concepts selected; abliteration will "
+            f"fall back to defaults.[/{THEME['warning']}]"
+        )
+        return None, None, True
+
+    kept_set = set(kept)
+    filtered = [m for m in mined if m.concept in kept_set]
+    concepts = [m.concept for m in filtered]
+    token_ids = {m.concept: m.token_id for m in filtered}
+    dropped = [m.concept for m in mined if m.concept not in kept_set]
+    if dropped:
+        console.print(
+            f"[{THEME['muted']}]Dropped {len(dropped)} concept(s): "
+            f"{', '.join(repr(c) for c in dropped)}[/{THEME['muted']}]"
+        )
+    console.print(
+        f"[{THEME['success']}]Using {len(concepts)} concept(s) for J-space "
+        f"restriction: {', '.join(repr(c) for c in concepts)}[/{THEME['success']}]"
+    )
+    return concepts, token_ids, True
+
+
 def run_jlens_map_generation(
     model_path: str,
     output_path: str,
@@ -1133,12 +1261,19 @@ def run_jlens_iterative_mode(
     dtype: str = "float16",
     max_iterations: int = 10,
     target_refusal_rate: float = 0.05,
-    step_multiplier: float = 0.4,
+    step_multiplier: float = 1.0,
+    max_step_multiplier: float = 1.0,
+    step_escalation: bool = True,
     eval_prompt_count: int = 50,
+    track_kl: bool = True,
     use_kl_guardrail: bool = False,
     kl_threshold: float = 0.5,
     kl_reference_prompts: Optional[str] = None,
     concepts: Optional[list[str]] = None,
+    abliteration_num_prompts: int = 32,
+    filter_prompts: bool = True,
+    refusal_threshold: float = -7.0,
+    auto_calibrate_threshold: bool = False,
     num_prompts: int = 32,
     batch_size: int = 2,
     max_seq_len: int = 64,
@@ -1163,10 +1298,17 @@ def run_jlens_iterative_mode(
             max_iterations=max_iterations,
             target_refusal_rate=target_refusal_rate,
             step_multiplier=step_multiplier,
+            max_step_multiplier=max_step_multiplier,
+            step_escalation=step_escalation,
             eval_prompt_count=eval_prompt_count,
+            track_kl=track_kl,
             use_kl_guardrail=use_kl_guardrail,
             kl_threshold=kl_threshold,
             kl_reference_prompts_path=kl_reference_prompts,
+            abliteration_num_prompts=abliteration_num_prompts,
+            filter_prompts=filter_prompts,
+            refusal_threshold=refusal_threshold,
+            auto_calibrate_threshold=auto_calibrate_threshold,
             jlens_concepts=(list(concepts) if concepts else list(DEFAULT_REFUSAL_CONCEPTS)),
             jlens_num_prompts=num_prompts,
             jlens_batch_size=batch_size,
@@ -1496,6 +1638,35 @@ def run_jspace_workflow() -> None:
             style=custom_style,
         ).ask()
 
+        # Interactive consensus-concept review: mine now, let the user deselect,
+        # then pass the filtered list as explicit concepts (mining flag off).
+        # Skipping this when the user chose "defaults" or "manual" earlier.
+        effective_concepts = concepts
+        effective_token_ids: Optional[dict[str, int]] = None
+        effective_mine_flag = mine_concepts_flag
+        if mine_concepts_flag and not cached_path:
+            preview_num_prompts = max(num_prompts, 64)
+            edited_concepts, edited_token_ids, ok = preview_and_edit_mined_concepts(
+                model_path=model_path,
+                device=device,
+                dtype=dtype,
+                mining_mode=mining_mode,
+                mine_top_k=mine_top_k,
+                mine_min_specificity=mine_min_specificity,
+                mine_num_positions=mine_num_positions,
+                mine_num_prompts=preview_num_prompts,
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+            )
+            if not ok:
+                return
+            # If the user kept concepts, disable in-pipeline mining so we don't
+            # redo the work. If mining yielded nothing, fall through to defaults
+            # (edited_concepts=None, mine flag stays off — pipeline uses DEFAULT_REFUSAL_CONCEPTS).
+            effective_concepts = edited_concepts
+            effective_token_ids = edited_token_ids
+            effective_mine_flag = False
+
         # Build abliteration config and dispatch to run_abliteration
         abl_config = dict(get_default_settings())
         abl_config.update({
@@ -1515,18 +1686,26 @@ def run_jspace_workflow() -> None:
             "jlens_batch_size": batch_size,
             "jlens_max_seq_len": max_seq_len,
             "jlens_grad_checkpoint": grad_checkpoint,
-            "jlens_concepts": concepts,
-            "mine_jlens_concepts": mine_concepts_flag,
+            "jlens_concepts": effective_concepts,
+            "jlens_concept_token_ids": effective_token_ids,
+            "mine_jlens_concepts": effective_mine_flag,
             "mine_top_k": mine_top_k,
             "mine_min_specificity": mine_min_specificity,
             "mining_mode": mining_mode,
             "mine_num_positions": mine_num_positions,
         })
 
-        concept_source_label = (
-            f"auto-mine ({mining_mode}, top {mine_top_k}, min={mine_min_specificity})"
-            if mine_concepts_flag else (concepts or "default")
-        )
+        if effective_concepts:
+            concept_source_label = (
+                f"user-edited consensus ({len(effective_concepts)} concept(s)): "
+                f"{', '.join(repr(c) for c in effective_concepts)}"
+            )
+        elif effective_mine_flag:
+            concept_source_label = (
+                f"auto-mine ({mining_mode}, top {mine_top_k}, min={mine_min_specificity})"
+            )
+        else:
+            concept_source_label = concepts or "default"
         display_config_panel(
             {
                 "mode": "jlens-restrict",
@@ -1553,11 +1732,16 @@ def run_jspace_workflow() -> None:
         run_abliteration(abl_config)
 
         # Overwrite the default abliteration_config.json with a J-space-specific one.
-        # (run_abliteration mines its own concepts inside compute_refusal_directions,
-        # so we don't have direct access to the resulting concept list here — we
-        # record the intent + settings that produced them.)
         try:
             from src.jlens import build_jspace_config_dict as _build, save_jspace_config_json as _save
+            if effective_concepts and mine_concepts_flag:
+                concept_source = "auto-mine-edited"
+            elif effective_mine_flag:
+                concept_source = "auto-mine"
+            elif concepts:
+                concept_source = "manual"
+            else:
+                concept_source = "defaults"
             payload = _build(
                 mode="restrict",
                 model_path=model_path,
@@ -1574,11 +1758,9 @@ def run_jspace_workflow() -> None:
                     "cached_vectors_path": cached_path,
                 },
                 concepts_params={
-                    "source": (
-                        "auto-mine" if mine_concepts_flag
-                        else ("manual" if concepts else "defaults")
-                    ),
-                    "concepts": concepts,
+                    "source": concept_source,
+                    "concepts": effective_concepts if effective_concepts else concepts,
+                    "concept_token_ids": effective_token_ids,
                     "mining_mode": mining_mode if mine_concepts_flag else None,
                     "mining_top_k": mine_top_k if mine_concepts_flag else None,
                     "mining_min_score": mine_min_specificity if mine_concepts_flag else None,
@@ -1607,10 +1789,43 @@ def run_jspace_workflow() -> None:
             style=custom_style,
         ).ask())
         step_multiplier = float(questionary.text(
-            "Per-iteration ablation strength:",
-            default="0.4",
+            "Per-iteration ablation strength (initial step, 1.0 = matches restrict mode):",
+            default="1.0",
             style=custom_style,
         ).ask())
+        step_escalation = questionary.confirm(
+            "Grow step multiplier when plateauing far from target?",
+            default=True,
+            style=custom_style,
+        ).ask()
+        max_step_multiplier = float(questionary.text(
+            "Max step multiplier when escalating:",
+            default="1.0",
+            style=custom_style,
+        ).ask()) if step_escalation else step_multiplier
+        # Base abliteration params (aligned with restrict mode)
+        abliteration_num_prompts = int(questionary.text(
+            "Number of prompts for direction extraction (harmful+harmless):",
+            default=str(get_default_num_prompts()),
+            style=custom_style,
+        ).ask())
+        filter_prompts = questionary.confirm(
+            "Filter harmful prompts by actual refusal? (recommended, matches restrict mode)",
+            default=True,
+            style=custom_style,
+        ).ask()
+        auto_calibrate_threshold = questionary.confirm(
+            "Auto-calibrate refusal-detector threshold? (recommended — the default -7.0 is wrong for many models; adds ~1-2 min for a mini-audit at loop start)",
+            default=True,
+            style=custom_style,
+        ).ask()
+        refusal_threshold = -7.0
+        if not auto_calibrate_threshold:
+            refusal_threshold = float(questionary.text(
+                "Refusal-detector threshold (max anchor log-prob > threshold ⇒ predict refusal). Run `python -m utils.test_abliteration audit` to find the right value.",
+                default="-7.0",
+                style=custom_style,
+            ).ask())
         eval_prompt_count = int(questionary.text(
             "Refusal-rate probe size per iteration:",
             default="50",
@@ -1627,11 +1842,16 @@ def run_jspace_workflow() -> None:
             style=custom_style,
         ).ask())
 
+        track_kl = questionary.confirm(
+            "Track KL(base||current) each iteration as a diagnostic? (recommended; caches reference logits up-front)",
+            default=True,
+            style=custom_style,
+        ).ask()
         use_kl_guardrail = questionary.confirm(
             "Enable KL guardrail? (roll back iteration if KL from original exceeds threshold)",
             default=False,
             style=custom_style,
-        ).ask()
+        ).ask() if track_kl else False
         kl_threshold = 0.5
         if use_kl_guardrail:
             kl_threshold = float(questionary.text(
@@ -1653,10 +1873,17 @@ def run_jspace_workflow() -> None:
             "max_iterations": max_iterations,
             "target_refusal_rate": target_refusal_rate,
             "step_multiplier": step_multiplier,
+            "step_escalation": step_escalation,
+            "max_step_multiplier": max_step_multiplier,
+            "abliteration_num_prompts": abliteration_num_prompts,
+            "filter_prompts": filter_prompts,
+            "auto_calibrate_threshold": auto_calibrate_threshold,
+            "refusal_threshold": refusal_threshold if not auto_calibrate_threshold else "auto",
             "eval_prompt_count": eval_prompt_count,
+            "track_kl": track_kl,
             "use_kl_guardrail": use_kl_guardrail,
             "kl_threshold": kl_threshold if use_kl_guardrail else "n/a",
-            "num_prompts": num_prompts,
+            "jlens_num_prompts": num_prompts,
             "batch_size": batch_size,
             "max_seq_len": max_seq_len,
             "grad_checkpoint": grad_checkpoint,
@@ -1675,10 +1902,17 @@ def run_jspace_workflow() -> None:
             max_iterations=max_iterations,
             target_refusal_rate=target_refusal_rate,
             step_multiplier=step_multiplier,
+            max_step_multiplier=max_step_multiplier,
+            step_escalation=step_escalation,
             eval_prompt_count=eval_prompt_count,
+            track_kl=track_kl,
             use_kl_guardrail=use_kl_guardrail,
             kl_threshold=kl_threshold,
             concepts=concepts,
+            abliteration_num_prompts=abliteration_num_prompts,
+            filter_prompts=filter_prompts,
+            refusal_threshold=refusal_threshold,
+            auto_calibrate_threshold=auto_calibrate_threshold,
             num_prompts=num_prompts,
             batch_size=batch_size,
             max_seq_len=max_seq_len,
@@ -4124,9 +4358,16 @@ def main_menu():
 # --jlens-iterative mode sub-flags
 @click.option("--jlens-max-iterations", type=int, default=10, help="Max iterations for --jlens-iterative (default: 10)")
 @click.option("--jlens-target-refusal-rate", type=float, default=0.05, help="Target refusal rate for --jlens-iterative convergence (default: 0.05)")
-@click.option("--jlens-step-multiplier", type=float, default=0.4, help="Per-iteration ablation strength for --jlens-iterative (default: 0.4)")
+@click.option("--jlens-step-multiplier", type=float, default=1.0, help="Per-iteration ablation strength (initial step) for --jlens-iterative. Default 1.0 = iteration 1 matches a single restrict-mode pass; later iterations re-mine J-lens on the modified model.")
+@click.option("--jlens-step-escalation/--no-jlens-step-escalation", default=True, help="Grow step multiplier when plateauing far from target (default: on)")
+@click.option("--jlens-max-step-multiplier", type=float, default=1.0, help="Max step multiplier when escalating (default: 1.0 = restrict-mode default)")
+@click.option("--jlens-abl-num-prompts", type=int, default=32, help="Number of prompts for direction extraction in --jlens-iterative (matches --num_prompts; default: 32)")
+@click.option("--jlens-filter-prompts/--no-jlens-filter-prompts", default=True, help="Filter harmful prompts by actual refusal before extraction (matches restrict mode; default: on)")
 @click.option("--jlens-eval-prompt-count", type=int, default=50, help="Number of prompts to evaluate refusal rate per iteration (default: 50)")
-@click.option("--jlens-iter-kl-guardrail/--no-jlens-iter-kl-guardrail", default=False, help="Roll back an iteration if KL from original exceeds --jlens-iter-kl-threshold")
+@click.option("--jlens-refusal-threshold", type=float, default=-7.0, help="Log-likelihood detector threshold (default: -7.0). Run `python -m utils.test_abliteration audit` to find the right value for your model — the default is wildly wrong for models like Qwen3.5.")
+@click.option("--jlens-auto-calibrate-threshold/--no-jlens-auto-calibrate-threshold", default=False, help="Run a mini-audit against actual generations at loop start and pick a threshold that maximizes agreement with the ground-truth classifier. Adds ~1-2 min startup on 9B models.")
+@click.option("--jlens-iter-track-kl/--no-jlens-iter-track-kl", default=True, help="Cache reference logits + compute KL(base||current) each iteration as a diagnostic (default: on). Turn off to save memory/time on very large models.")
+@click.option("--jlens-iter-kl-guardrail/--no-jlens-iter-kl-guardrail", default=False, help="Roll back an iteration if KL from original exceeds --jlens-iter-kl-threshold (implies --jlens-iter-track-kl)")
 @click.option("--jlens-iter-kl-threshold", type=float, default=0.5, help="KL nats threshold for --jlens-iter-kl-guardrail (default: 0.5)")
 # Contrastive concept mining (recommended: replaces the fixed refusal-concept list)
 @click.option("--jlens-mine-concepts/--no-jlens-mine-concepts", default=False, help="Auto-discover refusal concepts from the model's own next-token distribution (default: off; overrides --jlens-concepts when on)")
@@ -4153,7 +4394,10 @@ def cli(batch, jlens_map_mode, jlens_iterative_mode, model_path, output_path, nu
         jlens_concepts, jlens_num_prompts, jlens_batch_size, jlens_max_seq_len,
         jlens_grad_checkpoint, jlens_exclude_threshold, jlens_min_multiplier,
         jlens_max_iterations, jlens_target_refusal_rate, jlens_step_multiplier,
-        jlens_eval_prompt_count, jlens_iter_kl_guardrail, jlens_iter_kl_threshold,
+        jlens_step_escalation, jlens_max_step_multiplier,
+        jlens_abl_num_prompts, jlens_filter_prompts,
+        jlens_refusal_threshold, jlens_auto_calibrate_threshold,
+        jlens_eval_prompt_count, jlens_iter_track_kl, jlens_iter_kl_guardrail, jlens_iter_kl_threshold,
         jlens_mine_concepts, jlens_mine_top_k, jlens_mine_min_specificity, jlens_mining_mode):
     """
     Abliteration Toolkit - Remove refusal behavior from language models.
@@ -4226,11 +4470,18 @@ def cli(batch, jlens_map_mode, jlens_iterative_mode, model_path, output_path, nu
             max_iterations=jlens_max_iterations,
             target_refusal_rate=jlens_target_refusal_rate,
             step_multiplier=jlens_step_multiplier,
+            max_step_multiplier=jlens_max_step_multiplier,
+            step_escalation=jlens_step_escalation,
             eval_prompt_count=jlens_eval_prompt_count,
+            track_kl=jlens_iter_track_kl,
             use_kl_guardrail=jlens_iter_kl_guardrail,
             kl_threshold=jlens_iter_kl_threshold,
             kl_reference_prompts=kl_reference_prompts,
             concepts=parsed_concepts,
+            abliteration_num_prompts=jlens_abl_num_prompts,
+            filter_prompts=jlens_filter_prompts,
+            refusal_threshold=jlens_refusal_threshold,
+            auto_calibrate_threshold=jlens_auto_calibrate_threshold,
             num_prompts=jlens_num_prompts,
             batch_size=jlens_batch_size,
             max_seq_len=jlens_max_seq_len,
