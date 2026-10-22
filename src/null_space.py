@@ -121,7 +121,7 @@ def compute_null_space_projector_svd(
 
     Args:
         activations: [num_samples, hidden_dim] activation matrix
-        rank_ratio: Keep singular values explaining this fraction of variance
+        rank_ratio: Keep singular values explaining this fraction of activation energy
         min_null_dim: Minimum null space dimensions to preserve
         regularization: Added to singular values for stability
         max_samples: Maximum samples to use (subsample if exceeded for speed)
@@ -159,15 +159,13 @@ def compute_null_space_projector_svd(
         activations = activations[indices]
         n_samples = max_samples
 
-    # Center activations for better numerical properties
-    mean_act = activations.mean(dim=0, keepdim=True)
-    centered = activations - mean_act
-
+    # Preserve the row space of the original activations, including their mean.
+    # Centering would protect only deviations and discard a shared input direction.
     # Add small noise to break exact linear dependencies that cause SVD to fail
     # This is a common technique for ill-conditioned matrices
-    centered = centered + 1e-6 * torch.randn_like(centered)
+    svd_input = activations + 1e-6 * torch.randn_like(activations)
 
-    # SVD of centered activations
+    # SVD of uncentered preservation activations
     # Use randomized SVD for efficiency (much faster than full SVD)
     # Cap rank at 500 for speed - sufficient to capture preservation subspace
     max_rank_for_randomized = min(n_samples, hidden_dim, 500)
@@ -176,21 +174,21 @@ def compute_null_space_projector_svd(
         # Always use randomized SVD - it's faster and sufficient for our purpose
         # Full SVD is O(n*m^2) vs randomized O(n*k^2) where k << m
         logger.debug(f"Computing randomized SVD for {n_samples} samples, rank={max_rank_for_randomized}")
-        U, S, V = torch.svd_lowrank(centered, q=max_rank_for_randomized, niter=2)
+        U, S, V = torch.svd_lowrank(svd_input, q=max_rank_for_randomized, niter=2)
         Vh = V.T
     except RuntimeError as e:
         logger.warning(f"GPU randomized SVD failed, trying CPU randomized SVD: {e}")
         # Fallback 1: Try randomized SVD on CPU (often more stable than GPU cusolver)
         try:
-            centered_cpu = centered.cpu()
-            U, S, V = torch.svd_lowrank(centered_cpu, q=max_rank_for_randomized, niter=2)
+            svd_input_cpu = svd_input.cpu()
+            U, S, V = torch.svd_lowrank(svd_input_cpu, q=max_rank_for_randomized, niter=2)
             S = S.to(activations.device)
             Vh = V.T.to(activations.device)
         except RuntimeError as e2:
             logger.warning(f"CPU SVD failed, trying regularized eigendecomposition: {e2}")
             # Fallback 2: eigendecomposition of K^T @ K with regularization
             try:
-                gram = centered.T @ centered
+                gram = svd_input.T @ svd_input
                 # Add stronger Tikhonov regularization for numerical stability
                 # Use max of explicit regularization and data-adaptive regularization
                 trace_reg = regularization * torch.trace(gram) / hidden_dim
@@ -210,7 +208,7 @@ def compute_null_space_projector_svd(
                 try:
                     # svd_lowrank is more robust for ill-conditioned matrices
                     target_rank = min(n_samples, hidden_dim, 500)
-                    U, S, V = torch.svd_lowrank(centered, q=target_rank, niter=5)
+                    U, S, V = torch.svd_lowrank(svd_input, q=target_rank, niter=5)
                     Vh = V.T
                 except RuntimeError as e4:
                     logger.warning(f"Randomized SVD failed, using safe fallback: {e4}")
@@ -220,11 +218,11 @@ def compute_null_space_projector_svd(
                     Vh = torch.zeros(1, hidden_dim, device=activations.device, dtype=activations.dtype)
                     Vh[0, 0] = 1.0  # Arbitrary unit vector
 
-    # Determine effective rank based on variance explained
+    # Determine effective rank based on activation energy explained
     total_var = (S**2).sum()
     if total_var > 0:
         cumvar = torch.cumsum(S**2, dim=0) / total_var
-        # Find rank that explains rank_ratio of variance
+        # Find rank that explains rank_ratio of activation energy
         rank_by_var = (cumvar < rank_ratio).sum().item() + 1
     else:
         rank_by_var = 1
